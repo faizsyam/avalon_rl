@@ -7,6 +7,7 @@ from game.state import GameState, VoteRecord, MissionRecord, DiscussionEntry, HU
 from agents.prompts import (
     build_system_prompt,
     get_discussion_prompt,
+    get_rejection_discussion_prompt,
     get_proposal_prompt,
     get_vote_prompt,
     get_mission_prompt,
@@ -149,15 +150,20 @@ class GameEngine:
                 approved_team = team
                 break
 
+            # Post-rejection reactive discussion
+            from storage.printer import DIM, RESET
+            print(f"\n  {DIM}[Reactions to rejected proposal...]{RESET}")
+            self._run_rejection_discussion(state, team, record)
+
             state.leader_slot = (state.leader_slot + 1) % 5
             state.proposal_num += 1
 
         if approved_team is None:
-            state.log_lines.append("5 proposals rejected — evil wins this quest automatically.")
+            state.log_lines.append("5 proposals rejected — evil wins the entire game immediately.")
             state.mission_history.append(MissionRecord(quest_num=q, team=[], num_fails=0, result="FAIL_AUTO"))
-            state.evil_wins += 1
+            state.evil_wins = QUESTS_TO_WIN
             print_five_proposals_auto()
-            self._broadcast_event_note(state, f"[EVENT] Q{q}: 5 proposals rejected — evil auto-wins quest. Score G{state.good_wins}/E{state.evil_wins}")
+            self._broadcast_event_note(state, f"[EVENT] Q{q}: 5 proposals rejected — evil auto-wins the game. Score G{state.good_wins}/E{state.evil_wins}")
         else:
             self._run_mission(state, approved_team)
 
@@ -249,6 +255,27 @@ class GameEngine:
                 self._append_note(state, slot, f"[Q{state.quest_num} Vote] {note}")
             print_vote(slot, role, votes[slot], speeches[slot], state.slot_to_name)
         return votes, speeches
+
+    def _run_rejection_discussion(self, state: GameState, rejected_team: list, vote_record):
+        state.log_lines.append("\n[REJECTION REACTION]")
+        order = list(range(5))
+        for slot in order:
+            role = state.slot_to_role[slot]
+            result = call_llm_json(
+                self.llm,
+                self._system(role, state),
+                get_rejection_discussion_prompt(state, slot, rejected_team, vote_record),
+                call_label=f"rejection-react Q{state.quest_num} Slot{slot}",
+            )
+            statement = result.get("statement", "").strip() or "..."
+            note = result.get("private_note", "")
+            entry = DiscussionEntry(quest_num=state.quest_num, slot_id=slot, role=role, statement=statement)
+            state.discussion_log.append(entry)
+            name = state.slot_to_name[slot]
+            state.log_lines.append(f'  {name}: "{statement}"')
+            if note:
+                self._append_note(state, slot, f"[Q{state.quest_num} Rejection] {note}")
+            print_statement(slot, role, statement, state.slot_to_name)
 
     def _run_mission(self, state: GameState, team: List[int]):
         state.log_lines.append(f"\n[MISSION] Team: {team}")

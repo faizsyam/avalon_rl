@@ -258,17 +258,24 @@ def consolidate_lessons(role: str, llm, game_id: int):
         return
     current = open(path, "r", encoding="utf-8").read()
     dims = ROLES_CONFIG[role]["dimensions"]
-    system = "You are consolidating a strategic memory file for an AI game agent. Clean and sharpen the lessons."
+    system = (
+        f"You are consolidating a strategic memory file for the {role} role in Avalon. "
+        "Clean, deduplicate, and promote lessons. Be strict."
+    )
     user = (
         f"Current lessons file for {role}:\n\n{current}\n\n"
-        "Tasks:\n"
-        "1. Merge near-duplicate lessons into one crisp rule.\n"
-        "2. Resolve contradictions — keep the more validated one or write a conditional.\n"
-        "3. Promote tentative lessons confirmed implicitly multiple times to ACTIVE.\n"
-        "4. Remove vague or unhelpful lessons.\n"
-        "5. Keep ACTIVE to max 6 per dimension. TENTATIVE to max 4.\n"
-        "6. Preserve exact file structure.\n\n"
-        'Return JSON only: {"updated_file": "complete file content as a string"}'
+        "TASKS — apply all:\n"
+        "1. MERGE: If 2+ TENTATIVE lessons in the same dimension say essentially the same thing, "
+        "merge them into one sharp rule and PROMOTE it to ACTIVE.\n"
+        "2. CONTRADICTIONS: If two lessons in the same dimension contradict each other, "
+        "keep the more specific/actionable one and deprecate the other with reason 'contradicts retained lesson'.\n"
+        "3. PROMOTE: Any TENTATIVE lesson that appears 2+ times (same concept, different wording) "
+        "across the file must be merged and moved to ACTIVE.\n"
+        "4. REMOVE: Delete any lesson that is vague (e.g. 'be careful', 'watch everyone'), "
+        "role-inappropriate (advice for a different role), or factually wrong about game mechanics.\n"
+        "5. CAPS: ACTIVE max 5 per dimension. TENTATIVE max 3 per dimension.\n"
+        "6. Preserve exact file structure: header lines, [dimension] tags, ACTIVE:/TENTATIVE:/DEPRECATED: zones.\n\n"
+        'Return JSON only: {"updated_file": "complete updated file as a single string"}'
     )
     result = call_llm_json(llm, system, user)
     updated = result.get("updated_file", "")
@@ -283,9 +290,14 @@ def consolidate_evil_coord(llm, game_id: int):
     if not os.path.exists(EVIL_COORD_FILE):
         return
     current = open(EVIL_COORD_FILE, "r", encoding="utf-8").read()
-    system = "You are consolidating an evil team coordination memory file."
+    system = "You are consolidating an evil team coordination memory file for Avalon. Be strict."
     user = (
-        f"{current}\n\nMerge duplicates, resolve contradictions, keep ACTIVE to 4 per dimension. "
+        f"{current}\n\n"
+        "TASKS:\n"
+        "1. Merge near-duplicate lessons into one sharp rule and PROMOTE merged result to ACTIVE.\n"
+        "2. Resolve contradictions — keep the more specific/actionable one, deprecate the other.\n"
+        "3. Remove vague lessons.\n"
+        "4. ACTIVE max 3 per dimension. TENTATIVE max 2 per dimension.\n"
         "Preserve structure.\n\n"
         'Return JSON only: {"updated_file": "complete file content"}'
     )

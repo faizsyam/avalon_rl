@@ -1,8 +1,11 @@
 import json
 import re
+import os
+
+from datetime import datetime
 
 from crewai import LLM
-from config import NVIDIA_API_KEY, NVIDIA_BASE_URL, MODEL_NAME, GAMEPLAY_MAX_TOKENS, REFLECTION_MAX_TOKENS
+from config import NVIDIA_API_KEY, NVIDIA_BASE_URL, MODEL_NAME, GAMEPLAY_MAX_TOKENS, REFLECTION_MAX_TOKENS, LOGS_DIR
 
 
 def create_llm() -> LLM:
@@ -75,17 +78,41 @@ def call_llm(llm: LLM, system: str, user: str) -> str:
         print(f"    [LLM ERROR] {e}")
         return ""
 
-
 def call_llm_json(llm: LLM, system: str, user: str, call_label: str = "") -> dict:
     suffix = "\n\nYour entire response must be a single valid JSON object. No prose before or after. No markdown fences."
+    
     response = call_llm(llm, system, user + suffix)
     result = parse_json(response)
+
     if not result:
         label_str = f" for {call_label}" if call_label else ""
-        print(f"    [WARN] Invalid JSON{label_str} — retrying")
-        retry = call_llm(llm, system,
-            f"Your previous response was not valid JSON. Return ONLY a JSON object — nothing else.\n\n{user}{suffix}")
+        warn_message = f"[WARN] Invalid JSON{label_str} — retrying"
+        print(f"    {warn_message}")
+
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        path = os.path.join(LOGS_DIR, f"warns.txt")
+
+        with open(path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"\n{'='*80}\n")
+            log_file.write(f"Timestamp   : {datetime.utcnow().isoformat()} UTC\n")
+            log_file.write(f"Warning     : {warn_message}\n")
+            log_file.write(f"call_label  : {call_label}\n")
+            log_file.write(f"system      : {system}\n")
+            log_file.write(f"user        : {user}\n")
+            log_file.write(f"suffix      : {suffix}\n")
+            log_file.write(f"response    : {response}\n")
+        retry = call_llm(
+            llm,
+            system,
+            f"Your previous response was not valid JSON. Return ONLY a JSON object — nothing else.\n\n{user}{suffix}"
+        )
         result = parse_json(retry)
         if not result:
-            print(f"    [WARN] Retry also failed{label_str} — using empty result")
+            retry_warn = f"[WARN] Retry also failed{label_str} — using empty result"
+            print(f"    {retry_warn}")
+
+            with open(path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"\n{retry_warn}\n")
+                log_file.write(f"retry_response : {retry}\n")
+
     return result

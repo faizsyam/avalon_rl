@@ -2,11 +2,13 @@ import os
 
 from config import (
     CONSOLIDATION_EVERY,
+    EARLY_CONSOLIDATION_GAMES,
     CHECKPOINT_EVERY,
     MAX_GAMES,
     LESSONS_DIR,
     LOGS_DIR,
     CHECKPOINTS_DIR,
+    PUBLIC_LESSONS_DIR,
 )
 from game.engine import GameEngine
 from agents.llm_client import create_llm, create_reflection_llm
@@ -34,7 +36,7 @@ from game.roles import ALL_ROLES
 
 
 def run():
-    for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR]:
+    for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR, PUBLIC_LESSONS_DIR]:
         os.makedirs(d, exist_ok=True)
     ensure_dirs()
 
@@ -68,7 +70,11 @@ def run():
             save_checkpoint(game_id)
             print_checkpoint(game_id)
 
-        if game_id % CONSOLIDATION_EVERY == 0:
+        should_consolidate = (
+            game_id in EARLY_CONSOLIDATION_GAMES or
+            (game_id > max(EARLY_CONSOLIDATION_GAMES, default=0) and game_id % CONSOLIDATION_EVERY == 0)
+        )
+        if should_consolidate:
             print_consolidation()
             for role in ALL_ROLES:
                 consolidate_lessons(role, llm, game_id)
