@@ -1,0 +1,89 @@
+import os
+
+from config import (
+    CONSOLIDATION_EVERY,
+    CHECKPOINT_EVERY,
+    MAX_GAMES,
+    LESSONS_DIR,
+    LOGS_DIR,
+    CHECKPOINTS_DIR,
+)
+from game.engine import GameEngine
+from agents.llm_client import create_llm, create_reflection_llm
+from memory.manager import ensure_dirs, consolidate_lessons, consolidate_evil_coord
+from reflection.reflector import run_reflection
+from evaluation.evaluator import (
+    load_metrics,
+    save_metrics,
+    record_game,
+    snapshot_lessons,
+    save_checkpoint,
+    check_stopping_criteria,
+)
+from storage.logger import save_game_log, save_run_state, load_run_state
+from storage.printer import (
+    print_reflection_header,
+    print_reflection_role,
+    print_consolidation,
+    print_checkpoint,
+    print_stats,
+    print_stop,
+    BOLD, YELLOW, RESET, DIM,
+)
+from game.roles import ALL_ROLES
+
+
+def run():
+    for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR]:
+        os.makedirs(d, exist_ok=True)
+    ensure_dirs()
+
+    llm = create_llm()
+    reflection_llm = create_reflection_llm()
+    engine = GameEngine(llm)
+    metrics = load_metrics()
+    start_game = load_run_state()
+
+    print(f"\n{BOLD}{'═'*60}{RESET}")
+    print(f"{BOLD}{YELLOW}  AVALON RL EXPERIMENT{RESET}")
+    print(f"{DIM}  Resuming from game {start_game}{RESET}")
+    print(f"{BOLD}{'═'*60}{RESET}")
+
+    for game_id in range(start_game, MAX_GAMES + 1):
+        state = engine.run_game(game_id)
+
+        save_game_log(state)
+        save_run_state(game_id)
+        metrics = record_game(state, metrics)
+
+        print_reflection_header()
+        deltas = run_reflection(state, reflection_llm)
+        for role, n in (deltas or {}).items():
+            print_reflection_role(role, n)
+
+        snapshot_lessons(metrics, game_id)
+        save_metrics(metrics)
+
+        if game_id % CHECKPOINT_EVERY == 0:
+            save_checkpoint(game_id)
+            print_checkpoint(game_id)
+
+        if game_id % CONSOLIDATION_EVERY == 0:
+            print_consolidation()
+            for role in ALL_ROLES:
+                consolidate_lessons(role, llm, game_id)
+            consolidate_evil_coord(llm, game_id)
+
+        print_stats(metrics["good_wins"], metrics["evil_wins"])
+
+        stop_reason = check_stopping_criteria(metrics, game_id)
+        if stop_reason:
+            print_stop(stop_reason)
+            save_checkpoint(game_id)
+            break
+
+    print(f"\n{BOLD}Experiment complete.{RESET}\n")
+
+
+if __name__ == "__main__":
+    run()

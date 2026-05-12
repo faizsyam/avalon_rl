@@ -1,0 +1,332 @@
+import random
+from typing import Dict, List, Tuple
+
+from config import QUEST_TEAM_SIZES, MAX_VOTE_FAILURES, QUESTS_TO_WIN
+from game.roles import ROLES_CONFIG, ALL_ROLES
+from game.state import GameState, VoteRecord, MissionRecord, DiscussionEntry, HUMAN_NAMES
+from agents.prompts import (
+    build_system_prompt,
+    get_discussion_prompt,
+    get_proposal_prompt,
+    get_vote_prompt,
+    get_mission_prompt,
+    get_assassin_prompt,
+)
+from agents.llm_client import call_llm_json
+from memory.manager import load_lessons, load_evil_coord
+from storage.printer import (
+    print_game_header, print_quest_header, print_discussion_header,
+    print_statement, print_proposal_header, print_proposal,
+    print_vote_header, print_vote, print_vote_result,
+    print_mission_header, print_mission_private, print_mission_result,
+    print_score, print_assassin_phase, print_assassin_guess,
+    print_outcome, print_five_proposals_auto,
+)
+
+
+class GameEngine:
+    def __init__(self, llm):
+        self.llm = llm
+
+    def _system(self, role: str, state: GameState) -> str:
+        special_info = self._build_special_info(role, state)
+        lessons = load_lessons(role)
+        evil_coord = load_evil_coord() if ROLES_CONFIG[role]["faction"] == "evil" else ""
+        return build_system_prompt(role, special_info, lessons, evil_coord)
+
+    def _build_special_info(self, role: str, state: GameState) -> str:
+        template = ROLES_CONFIG[role]["special_info_template"]
+        if role == "Merlin":
+            evil_names = [state.slot_to_name[state.role_to_slot[r]] for r in ["Assassin", "Morgana"]]
+            return template.format(evil_names=evil_names)
+        elif role == "Percival":
+            candidate_names = sorted([state.slot_to_name[state.role_to_slot[r]] for r in ["Merlin", "Morgana"]])
+            return template.format(merlin_candidate_names=candidate_names)
+        elif role in ["Assassin", "Morgana"]:
+            ally = "Morgana" if role == "Assassin" else "Assassin"
+            return template.format(evil_ally_name=state.slot_to_name[state.role_to_slot[ally]])
+        return template
+
+    def _append_note(self, state: GameState, slot_id: int, note: str):
+        """Append a note to a specific agent's private notes."""
+        if not note or not note.strip():
+            return
+        if slot_id not in state.agent_notes:
+            state.agent_notes[slot_id] = []
+        state.agent_notes[slot_id].append(note.strip())
+
+    def _broadcast_event_note(self, state: GameState, note: str, slots: List[int] = None):
+        """Write a factual game event note to all agents (or a subset)."""
+        targets = slots if slots is not None else list(range(5))
+        for slot in targets:
+            self._append_note(state, slot, note)
+
+    def setup_game(self, game_id: int) -> GameState:
+        state = GameState(game_id=game_id)
+        roles = ALL_ROLES.copy()
+        random.shuffle(roles)
+        for slot, role in enumerate(roles):
+            state.slot_to_role[slot] = role
+            state.role_to_slot[role] = slot
+            state.slot_to_faction[slot] = ROLES_CONFIG[role]["faction"]
+        state.leader_slot = random.randint(0, 4)
+
+        names = random.sample(HUMAN_NAMES, 5)
+        for slot, name in enumerate(names):
+            state.slot_to_name[slot] = name
+            state.name_to_slot[name] = slot
+
+        state.log_lines.append(f"=== GAME {game_id} ===")
+        state.log_lines.append(f"Names: {state.slot_to_name}")
+        state.log_lines.append(f"Roles: {state.slot_to_role}")
+        state.log_lines.append(f"Leader: {state.slot_to_name[state.leader_slot]}")
+        state.log_lines.append("")
+        print_game_header(game_id, state.slot_to_role, state.slot_to_name)
+        return state
+
+    def run_game(self, game_id: int) -> GameState:
+        state = self.setup_game(game_id)
+        while state.good_wins < QUESTS_TO_WIN and state.evil_wins < QUESTS_TO_WIN:
+            self._run_quest(state)
+        if state.good_wins == QUESTS_TO_WIN:
+            self._run_assassin_phase(state)
+            state.outcome = "EVIL_WINS" if state.assassin_correct else "GOOD_WINS"
+        else:
+            state.outcome = "EVIL_WINS"
+        state.log_lines.append(f"\n=== OUTCOME: {state.outcome} ===")
+        print_outcome(state.outcome)
+        return state
+
+    def _run_quest(self, state: GameState):
+        q = state.quest_num
+        team_size = QUEST_TEAM_SIZES[q - 1]
+        leader_role = state.slot_to_role[state.leader_slot]
+
+        state.log_lines.append(f"\n--- QUEST {q} (team size: {team_size}, leader: Slot {state.leader_slot}) ---")
+        print_quest_header(q, team_size, state.leader_slot, leader_role, state.slot_to_name)
+
+        self._run_discussion(state)
+
+        approved_team = None
+        for attempt in range(MAX_VOTE_FAILURES):
+            state.log_lines.append(f"\n[PROPOSAL {attempt + 1}] Leader: Slot {state.leader_slot}")
+            print_proposal_header(attempt + 1, state.leader_slot, state.slot_to_role[state.leader_slot], state.slot_to_name)
+
+            team = self._get_proposal(state, team_size)
+            votes, speeches = self._get_votes(state, team)
+
+            approve_count = sum(1 for v in votes.values() if v == "APPROVE")
+            result = "APPROVED" if approve_count > 2 else "REJECTED"
+
+            record = VoteRecord(
+                quest_num=q, proposal_num=attempt + 1,
+                proposer_slot=state.leader_slot, proposed_team=team,
+                votes=votes, speeches=speeches, result=result,
+            )
+            state.vote_history.append(record)
+
+            state.log_lines.append("[VOTES]")
+            for slot in range(5):
+                state.log_lines.append(
+                    f'  Slot {slot} ({state.slot_to_role[slot]}): {votes[slot]} — "{speeches[slot]}"'
+                )
+            state.log_lines.append(f"Vote result: {result} ({approve_count}/5 approve)")
+            print_vote_result(result, approve_count)
+
+            # Broadcast factual vote outcome as an event note to all agents
+            approvers = [s for s, v in votes.items() if v == "APPROVE"]
+            rejecters = [s for s, v in votes.items() if v == "REJECT"]
+            leader_name = state.slot_to_name[state.leader_slot]
+            team_names = [state.slot_to_name[s] for s in team]
+            approver_names = [state.slot_to_name[s] for s in approvers]
+            rejecter_names = [state.slot_to_name[s] for s in rejecters]
+            self._broadcast_event_note(
+                state,
+                f"[EVENT] Q{q}P{attempt+1}: {leader_name}→{team_names} {result} | A:{approver_names} R:{rejecter_names}"
+            )
+
+            if result == "APPROVED":
+                approved_team = team
+                break
+
+            state.leader_slot = (state.leader_slot + 1) % 5
+            state.proposal_num += 1
+
+        if approved_team is None:
+            state.log_lines.append("5 proposals rejected — evil wins this quest automatically.")
+            state.mission_history.append(MissionRecord(quest_num=q, team=[], num_fails=0, result="FAIL_AUTO"))
+            state.evil_wins += 1
+            print_five_proposals_auto()
+            self._broadcast_event_note(state, f"[EVENT] Q{q}: 5 proposals rejected — evil auto-wins quest. Score G{state.good_wins}/E{state.evil_wins}")
+        else:
+            self._run_mission(state, approved_team)
+
+        print_score(state.good_wins, state.evil_wins)
+        state.quest_num += 1
+        state.leader_slot = (state.leader_slot + 1) % 5
+        state.proposal_num = 1
+
+    def _run_discussion(self, state: GameState):
+        state.log_lines.append("\n[DISCUSSION]")
+        print_discussion_header()
+        order = list(range(5))
+        random.shuffle(order)
+
+        for slot in order:
+            role = state.slot_to_role[slot]
+            result = call_llm_json(
+                self.llm,
+                self._system(role, state),
+                get_discussion_prompt(state, slot),
+                call_label=f"discussion Q{state.quest_num} Slot{slot}",
+            )
+            statement = result.get("statement", "").strip() or "..."
+            note = result.get("private_note", "")
+
+            entry = DiscussionEntry(quest_num=state.quest_num, slot_id=slot, role=role, statement=statement)
+            state.discussion_log.append(entry)
+            name = state.slot_to_name[slot]
+            state.log_lines.append(f'  {name} ({role}): "{statement}"')
+
+            # Agent's own subjective note from discussion
+            if note:
+                self._append_note(state, slot, f"[Q{state.quest_num} Discussion] {note}")
+            print_statement(slot, role, statement, state.slot_to_name)
+
+    def _get_proposal(self, state: GameState, team_size: int) -> List[int]:
+        leader = state.leader_slot
+        role = state.slot_to_role[leader]
+        result = call_llm_json(
+            self.llm,
+            self._system(role, state),
+            get_proposal_prompt(state, leader, team_size),
+            call_label=f"proposal Q{state.quest_num} Slot{leader}",
+        )
+        speech = result.get("speech", "").strip() or "This is my pick."
+        note = result.get("private_note", "")
+        raw_team = result.get("proposed_team", [])
+
+        # Accept names (str) or slot ints from LLM
+        valid = []
+        for item in raw_team:
+            if isinstance(item, str) and item in state.name_to_slot:
+                s = state.name_to_slot[item]
+            elif isinstance(item, int) and 0 <= item < 5:
+                s = item
+            else:
+                continue
+            if s not in valid:
+                valid.append(s)
+        valid = valid[:team_size]
+        while len(valid) < team_size:
+            candidates = [s for s in range(5) if s not in valid]
+            valid.append(random.choice(candidates))
+
+        team_names = [state.slot_to_name[s] for s in valid]
+        leader_name = state.slot_to_name[leader]
+        state.log_lines.append(f'  {leader_name} ({role}) proposes {team_names}: "{speech}"')
+        if note:
+            self._append_note(state, leader, f"[Q{state.quest_num} Proposal] {note}")
+        print_proposal(leader, role, valid, speech, state.slot_to_name)
+        return valid
+
+    def _get_votes(self, state: GameState, team: List[int]) -> Tuple[Dict, Dict]:
+        votes, speeches = {}, {}
+        print_vote_header()
+        for slot in range(5):
+            role = state.slot_to_role[slot]
+            result = call_llm_json(
+                self.llm,
+                self._system(role, state),
+                get_vote_prompt(state, slot, state.leader_slot, team),
+                call_label=f"vote Q{state.quest_num} Slot{slot}",
+            )
+            v = result.get("vote", "APPROVE").upper()
+            votes[slot] = v if v in ("APPROVE", "REJECT") else "APPROVE"
+            speeches[slot] = result.get("speech", "").strip() or "..."
+            note = result.get("private_note", "")
+            if note:
+                self._append_note(state, slot, f"[Q{state.quest_num} Vote] {note}")
+            print_vote(slot, role, votes[slot], speeches[slot], state.slot_to_name)
+        return votes, speeches
+
+    def _run_mission(self, state: GameState, team: List[int]):
+        state.log_lines.append(f"\n[MISSION] Team: {team}")
+        print_mission_header(team, state.slot_to_name)
+        cards = []
+        for slot in team:
+            role = state.slot_to_role[slot]
+            if not ROLES_CONFIG[role]["can_fail_mission"]:
+                cards.append("SUCCESS")
+            else:
+                result = call_llm_json(
+                    self.llm,
+                    self._system(role, state),
+                    get_mission_prompt(state, slot, role, team),
+                    call_label=f"mission Q{state.quest_num} Slot{slot}",
+                )
+                raw_card = result.get("card", "SUCCESS").strip().upper()
+                # Defensive parse: accept any string containing FAIL or SUCCESS
+                if "FAIL" in raw_card:
+                    card = "FAIL"
+                else:
+                    card = "SUCCESS"
+                internal = result.get("internal_note", "").strip() or "..."
+                cards.append(card)
+                state.log_lines.append(f'  [PRIVATE] Slot {slot} ({role}) played {card}: "{internal}"')
+                print_mission_private(slot, role, card, internal, state.slot_to_name)
+
+        num_fails = cards.count("FAIL")
+        mission_result = "FAIL" if num_fails > 0 else "SUCCESS"
+        state.log_lines.append(f"Cards: {num_fails} FAIL(s) — Quest result: {mission_result}")
+        print_mission_result(mission_result, num_fails)
+
+        state.mission_history.append(
+            MissionRecord(quest_num=state.quest_num, team=team, num_fails=num_fails, result=mission_result)
+        )
+        if mission_result == "SUCCESS":
+            state.good_wins += 1
+        else:
+            state.evil_wins += 1
+
+        # Broadcast factual mission result to all agents
+        team_names = [state.slot_to_name[s] for s in team]
+        self._broadcast_event_note(
+            state,
+            f"[EVENT] Q{state.quest_num} MISSION: team={team_names} → {mission_result} ({num_fails} fail(s)). Score G{state.good_wins}/E{state.evil_wins}"
+        )
+
+    def _run_assassin_phase(self, state: GameState):
+        assassin_slot = state.role_to_slot["Assassin"]
+        merlin_slot = state.role_to_slot["Merlin"]
+        state.log_lines.append("\n--- ASSASSIN'S CHOICE ---")
+        print_assassin_phase(assassin_slot, "Assassin", state.slot_to_name)
+
+        result = call_llm_json(
+            self.llm,
+            self._system("Assassin", state),
+            get_assassin_prompt(state, assassin_slot),
+            call_label="assassin guess",
+        )
+        guess_name = result.get("guess_name", "")
+        reasoning = result.get("reasoning", "").strip() or "..."
+
+        # Resolve name to slot
+        guess = state.name_to_slot.get(guess_name, -1)
+        if guess == -1:
+            # Fallback: try partial match
+            for name, slot in state.name_to_slot.items():
+                if name.lower() in guess_name.lower():
+                    guess = slot
+                    break
+
+        state.assassin_guess_slot = guess
+        state.assassin_correct = guess == merlin_slot
+
+        assassin_name = state.slot_to_name[assassin_slot]
+        merlin_name = state.slot_to_name[merlin_slot]
+        guess_display = state.slot_to_name.get(guess, "unknown")
+        state.log_lines.append(f"{assassin_name} (Assassin) guesses {guess_display} is Merlin.")
+        state.log_lines.append(f'Reasoning: "{reasoning}"')
+        state.log_lines.append(f"Merlin was {merlin_name}. Correct: {state.assassin_correct}")
+        print_assassin_guess(guess, reasoning, merlin_slot, state.assassin_correct, state.slot_to_name)
