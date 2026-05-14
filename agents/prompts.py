@@ -161,12 +161,14 @@ NEVER publicly reveal:
 Role-aware reasoning belongs only in private_note or internal_note.
 
 Speak naturally like a real player at a tense table:
-- address players by name,
+- address yourself by 'I' or 'me', not using your name,
+- address other players by name,
 - react to specific statements,
 - base public reasoning on observable evidence only:
   mission outcomes, votes, and player behavior.
 
-Be expressive when appropriate. Every public statement should advance your objective.
+Be expressive and show emotion when appropriate.
+Every public statement and expression should advance your objective.
 """
 
 NOTE_DIRECTIVE = """
@@ -277,7 +279,7 @@ def _dynamic_priority_block(role: str, state) -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt(role: str, special_info: str, lessons: str, evil_coord: str = "", good_coord: str = "") -> str:
+def build_system_prompt(role: str, agent_name:str, special_info: str, lessons: str, evil_coord: str = "", good_coord: str = "") -> str:
     config = ROLES_CONFIG[role]
     role_ctx = ROLE_CONTEXT.get(role, "")
     lessons_block = "\n=== YOUR STRATEGIC MEMORY ===\n"
@@ -289,6 +291,8 @@ def build_system_prompt(role: str, special_info: str, lessons: str, evil_coord: 
         coord_block = f"\n=== GOOD TEAM COORDINATION MEMORY ===\n{good_coord.strip()}\n"
     return (
         f"{GAME_RULES}\n"
+        f"YOUR NAME: {agent_name}\n"
+        f"Never address yourself as {agent_name}, instead use 'I' or 'me'.\n"
         f"YOUR PRIVATE INFORMATION:\n{special_info}\n"
         f"{role_ctx}"
         f"{OPSEC_DIRECTIVE}\n"
@@ -323,6 +327,7 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
             f"  You are {my_name}. You are good and confirmed safe.\n"
+            f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
             f"  Evil players: {evil_names} — any mission team containing either of them can be sabotaged.\n"
             f"  Safe players (you + all non-evil): {safe_names}\n"
             f"  Any team composed entirely of safe players is guaranteed to succeed — no evil can sabotage it.\n"
@@ -333,6 +338,7 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
             f"  You are {my_name}. You are good and confirmed safe.\n"
+            f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
             f"  {candidates[0]} and {candidates[1]} both appear as Merlin — one is real Merlin (good), one is Morgana (evil).\n"
             f"  Observe who steers accurately without observable basis — that is real Merlin."
         )
@@ -343,6 +349,7 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
             f"  You are {my_name}. You are evil.\n"
+            f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
             f"  {ally} is Morgana, your evil ally. All others ({safe_from_evil}) are good.\n"
             f"  Either of you alone on a mission can play FAIL independently — you do not need to be together.\n"
             f"  Only ONE FAIL card is needed to fail an entire quest."
@@ -354,6 +361,7 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
             f"  You are {my_name}. You are evil.\n"
+            f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
             f"  {ally} is the Assassin, your evil ally. All others ({safe_from_evil}) are good.\n"
             f"  Either of you alone on a mission can play FAIL independently — you do not need to be together.\n"
             f"  Only ONE FAIL card is needed to fail an entire quest."
@@ -484,7 +492,7 @@ def _build_game_context(state, my_slot: int) -> str:
     leader_name = _n(state, state.leader_slot)
     parts = [
         f"=== Q{state.quest_num}/5 (team size: {QUEST_TEAM_SIZES[state.quest_num - 1]}) | Good: {state.good_wins} | Evil: {state.evil_wins} ===",
-        f"You are {my_name} — speak and reason as {my_name}, not about {my_name}. Current leader: {leader_name}.", "",
+        f"IMPORTANT: You are {my_name}. Never address yourself as {my_name}, instead use 'I' or 'me'.\nCurrent leader: {leader_name}.", "",
         _build_name_roster(state, my_slot), "",
     ]
     reminder = _build_role_knowledge_reminder(state, my_slot)

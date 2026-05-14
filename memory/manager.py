@@ -1,13 +1,9 @@
 import os
 from typing import Dict, List, Optional
 
-from config import LESSONS_DIR, EVIL_COORD_FILE
+from config import LESSONS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
 from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, GOOD_COORD_DIMENSIONS, ALL_ROLES
 
-# ---------------------------------------------------------------------------
-# Good-team coordination file — mirrors evil_coordination for Merlin/Percival/LoyalServant
-# ---------------------------------------------------------------------------
-GOOD_COORD_FILE = os.path.join(LESSONS_DIR, "good_coord.txt")
 
 GOOD_COORD_DIMENSIONS = [
     "merlin_signal_protection",       # How Merlin signals evil reads without exposing role
@@ -29,11 +25,6 @@ def ensure_dirs():
 
 def get_lesson_path(role: str) -> str:
     return os.path.join(LESSONS_DIR, f"{role.lower()}.txt")
-
-
-# ---------------------------------------------------------------------------
-# File initialisation
-# ---------------------------------------------------------------------------
 
 def _init_lesson_file(role: str) -> str:
     dims = ROLES_CONFIG[role]["dimensions"]
@@ -60,11 +51,6 @@ def _init_good_coord() -> str:
     }, GOOD_COORD_DIMENSIONS)
     _write(GOOD_COORD_FILE, content)
     return content
-
-
-# ---------------------------------------------------------------------------
-# Low-level IO
-# ---------------------------------------------------------------------------
 
 def _write(path: str, content: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -127,24 +113,7 @@ def _bump_version(parsed: Dict, game_id: int) -> Dict:
     parsed["header"] = new_header
     return parsed
 
-
-# ---------------------------------------------------------------------------
-# Lesson loading (what agents read before acting)
-# ---------------------------------------------------------------------------
-
 def load_lessons(role: str) -> str:
-    """
-    Returns ACTIVE lessons (high confidence) and TENTATIVE lessons (provisional)
-    as clearly separated sections. DEPRECATED lessons are never shown.
-
-    Lesson lifecycle:
-    - TENTATIVE: newly proposed from one game — injected with a caveat label so
-      agents treat them as provisional hypotheses, not confirmed strategy.
-    - ACTIVE: confirmed across multiple games via confirm_active deltas — injected
-      as primary guidance. Outcome tags (WIN/LOSS) are preserved so agents can
-      assess how reliable a lesson is across different game outcomes.
-    - DEPRECATED: failed strategies — never injected. Kept in file for audit only.
-    """
     path = get_lesson_path(role)
     if not os.path.exists(path):
         _init_lesson_file(role)
@@ -183,7 +152,6 @@ def load_lessons(role: str) -> str:
 
 
 def load_evil_coord() -> str:
-    """Load evil coordination memory, separated by confidence tier."""
     if not os.path.exists(EVIL_COORD_FILE):
         _init_evil_coord()
         return ""
@@ -242,12 +210,7 @@ def load_good_coord() -> str:
         output.extend(tentative_lines)
     return "\n".join(output)
 
-# ---------------------------------------------------------------------------
-# Delta application helpers
-# ---------------------------------------------------------------------------
-
 def _resolve_dim(parsed_dims: dict, raw_dim: str) -> Optional[str]:
-    """Return the actual key in parsed_dims matching raw_dim after normalisation, or None."""
     normalized = raw_dim.strip().lower().replace(" ", "_")
     if normalized in parsed_dims:
         return normalized
@@ -258,11 +221,6 @@ def _resolve_dim(parsed_dims: dict, raw_dim: str) -> Optional[str]:
 
 
 def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 6) -> bool:
-    """
-    Rough duplicate check: if a new lesson shares more than `threshold` words
-    with any existing lesson, treat it as a near-duplicate.
-    Prevents the tentative list from filling up with restatements of the same rule.
-    """
     new_words = set(new_lesson.lower().split())
     for existing in existing_lessons:
         existing_words = set(existing.lower().split())
@@ -287,7 +245,6 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str])
         if not dim:
             continue
 
-        # Enforce per-dimension tentative cap — do not add if already at limit.
         existing_tentative = parsed["dimensions"][dim]["tentative"]
         if len(existing_tentative) >= TENTATIVE_CAP:
             continue
@@ -299,9 +256,6 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str])
 
         parsed["dimensions"][dim]["tentative"].append(f"- {tag} {lesson}")
 
-    # ---- confirm_active ----
-    # Only move lessons that already exist in tentative (found by keyword).
-    # Do NOT silently add to active if not found — this was the duplication bug.
     for item in delta.get("confirm_active", []):
         if not isinstance(item, dict):
             continue
@@ -315,15 +269,11 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str])
         tentative = parsed["dimensions"][dim]["tentative"]
         for i, t in enumerate(tentative):
             if keyword in t.lower():
-                # Promote: annotate with confirmation count if already in active (re-confirms).
-                promoted = t  # preserve original tag + text
+                promoted = t
                 parsed["dimensions"][dim]["active"].append(promoted)
                 tentative.pop(i)
                 break
-        # If keyword not found in tentative, skip — do not add directly to active.
-        # This prevents phantom lessons from appearing in the active list.
 
-    # ---- flag_deprecated ----
     for item in delta.get("flag_deprecated", []):
         if not isinstance(item, dict):
             continue
@@ -346,11 +296,6 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str])
                     break
 
     return parsed
-
-
-# ---------------------------------------------------------------------------
-# Public apply functions
-# ---------------------------------------------------------------------------
 
 def apply_lesson_delta(role: str, delta: dict, game_id: int):
     dims = ROLES_CONFIG[role]["dimensions"]
@@ -383,11 +328,6 @@ def apply_good_coord_delta(delta: dict, game_id: int):
     parsed = _apply_delta(parsed, delta, game_id, GOOD_COORD_DIMENSIONS)
     parsed = _bump_version(parsed, game_id)
     _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_DIMENSIONS))
-
-
-# ---------------------------------------------------------------------------
-# Consolidation
-# ---------------------------------------------------------------------------
 
 def consolidate_lessons(role: str, llm, game_id: int):
     """
@@ -493,11 +433,6 @@ def consolidate_good_coord(llm, game_id: int):
         parsed = _parse(updated, GOOD_COORD_DIMENSIONS)
         parsed = _bump_version(parsed, game_id)
         _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_DIMENSIONS))
-
-
-# ---------------------------------------------------------------------------
-# Consolidation trigger
-# ---------------------------------------------------------------------------
 
 def should_consolidate_now(tentative_threshold: int = CONSOLIDATION_THRESHOLD) -> bool:
     """

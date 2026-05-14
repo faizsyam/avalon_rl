@@ -8,17 +8,12 @@ from memory.manager import (
     apply_evil_coord_delta,
     apply_good_coord_delta,
 )
-# Minimum lessons required per reflection call before accepting the response.
+
 MIN_LESSONS_PER_REFLECTION = 3
 MAX_REFLECTION_RETRIES = 2
 
 GOOD_ROLES = {"Merlin", "Percival", "LoyalServant"}
 EVIL_ROLES = {"Assassin", "Morgana"}
-
-
-# ---------------------------------------------------------------------------
-# Sanitisation helpers
-# ---------------------------------------------------------------------------
 
 def _sanitize_names(text: str, names: list) -> str:
     result = text
@@ -40,23 +35,10 @@ def _sanitize_delta(delta: dict, all_names: list) -> dict:
 def _n(state: GameState, slot: int) -> str:
     return state.slot_to_name.get(slot, f"Slot{slot}")
 
-
-# ---------------------------------------------------------------------------
-# Context formatting
-# ---------------------------------------------------------------------------
-
 def _format_agent_context(state: GameState, slot_id: int) -> str:
-    """
-    Build a rich context block for the reflecting agent that includes:
-    - The agent's own statements, votes, proposals, and mission results.
-    - ALL other players' statements and votes so the agent can observe
-      behavioral patterns across the full game — essential for learning
-      deception signatures, Merlin tells, and coordination patterns.
-    """
     lines = []
     all_names = list(state.slot_to_name.values())
 
-    # ---- Own decisions ----
     statements = [(d.quest_num, d.statement) for d in state.discussion_log if d.slot_id == slot_id]
     if statements:
         lines.append("YOUR STATEMENTS:")
@@ -88,7 +70,6 @@ def _format_agent_context(state: GameState, slot_id: int) -> str:
         for n in notes:
             lines.append(f"  {n}")
 
-    # ---- Full discussion log (all players) — critical for behavioral pattern learning ----
     if state.discussion_log:
         lines.append("\n--- FULL DISCUSSION LOG (ALL PLAYERS) ---")
         lines.append("Use this to identify behavioral signatures, deception patterns, and role tells.")
@@ -97,7 +78,6 @@ def _format_agent_context(state: GameState, slot_id: int) -> str:
             marker = " [YOU]" if d.slot_id == slot_id else ""
             lines.append(f"  Q{d.quest_num} {speaker_name}{marker}: \"{d.statement}\"")
 
-    # ---- All players' vote breakdown ----
     lines.append("\n--- FULL VOTE BREAKDOWN (ALL PLAYERS) ---")
     for v in state.vote_history:
         lines.append(f"  Q{v.quest_num}P{v.proposal_num} — {_n(state, v.proposer_slot)} proposed "
@@ -107,11 +87,6 @@ def _format_agent_context(state: GameState, slot_id: int) -> str:
             lines.append(f"    {_n(state, s)}{marker}: {vt}")
 
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Prompt builders
-# ---------------------------------------------------------------------------
 
 def _build_strategic_summary(state: GameState) -> str:
     evil_slots = {state.role_to_slot.get("Assassin"), state.role_to_slot.get("Morgana")}
@@ -185,6 +160,53 @@ def _build_role_targeted_questions(role: str, state: GameState, slot_id: int) ->
         ]
         return "\n".join(lines)
         
+def _build_epistemic_constraints(role: str, state: GameState, slot_id: int) -> str:
+    evil_slots = {state.role_to_slot.get("Assassin"), state.role_to_slot.get("Morgana")}
+    merlin_slot = state.role_to_slot.get("Merlin")
+    morgana_slot = state.role_to_slot.get("Morgana")
+
+    lines = ["⚠️  EPISTEMIC CONSTRAINTS — CRITICAL FOR LESSON QUALITY:"]
+    lines.append("Your lessons must be derivable from what you could observe DURING the game.")
+    lines.append("Do NOT write lessons that assume post-game role reveals unless explicitly noted below.")
+    lines.append("")
+
+    if role == "Merlin":
+        evil_names = [_n(state, s) for s in evil_slots if s is not None]
+        lines.append(f"WHAT YOU KNEW: Evil players' identities from game start ({evil_names}).")
+        lines.append("WHAT YOU DIDN'T KNOW: Whether the Assassin suspected you; other players' private reasoning.")
+        lines.append("LESSON RULE: Any lesson about 'who was evil' is VALID — you knew this in-game.")
+        lines.append("LESSON RULE: Any lesson about 'why the Assassin guessed me' requires behavioral inference only.")
+
+    elif role == "Percival":
+        merlin_name = _n(state, merlin_slot)
+        morgana_name = _n(state, morgana_slot)
+        lines.append(f"WHAT YOU KNEW: Two players appeared as Merlin to you: the real Merlin and Morgana.")
+        lines.append(f"POST-GAME REVEAL (do not use as if known during play): Real Merlin={merlin_name}, Morgana={morgana_name}.")
+        lines.append("LESSON RULE: Lessons about 'which player was Merlin' must be framed as inference, not fact.")
+        lines.append("LESSON RULE: 'I now know X was Morgana' is hindsight. Reframe as 'behavioral signal Y suggests Morgana'.")
+
+    elif role == "LoyalServant":
+        lines.append("WHAT YOU KNEW: Nothing about roles. Only observable evidence: votes, proposals, quest outcomes.")
+        lines.append("POST-GAME REVEAL (do not treat as in-game knowledge): Full role assignments.")
+        lines.append("LESSON RULE: Every lesson must be derivable from observable behavior ALONE.")
+        lines.append("LESSON RULE: Do NOT write 'I identified the evil player' unless you can cite the specific")
+        lines.append("            observable evidence chain (votes, proposals, patterns) that led there.")
+        lines.append("LESSON RULE: If the role reveal confirmed a suspicion, frame it as 'suspicion confirmed by reveal'")
+        lines.append("            — not as 'I correctly identified' (you may have guessed correctly by luck).")
+
+    elif role == "Assassin":
+        merlin_name = _n(state, merlin_slot)
+        lines.append(f"WHAT YOU KNEW: Morgana's identity, your own role. Evil team coordination.")
+        lines.append(f"POST-GAME REVEAL: Merlin was {merlin_name}.")
+        lines.append("LESSON RULE: Lessons about Merlin identification must separate 'what I observed' from 'what was true'.")
+        lines.append("LESSON RULE: 'Merlin was X because of behavior Y' is valid only if Y was observable during play.")
+
+    elif role == "Morgana":
+        lines.append("WHAT YOU KNEW: Assassin's identity, your own role.")
+        lines.append("LESSON RULE: Lessons must reflect your actual deception opportunities, not post-hoc rationalization.")
+
+    return "\n".join(lines)
+
 def _build_reflection_prompt(role: str, state: GameState, slot_id: int) -> tuple:
     config = ROLES_CONFIG[role]
     faction = config["faction"]
@@ -218,7 +240,6 @@ def _build_reflection_prompt(role: str, state: GameState, slot_id: int) -> tuple
             f"Merlin was {merlin_name}. Correct: {state.assassin_correct}"
         )
 
-    # ---- Role-specific deep analysis blocks ----
     assassination_analysis = ""
 
     if role == "Merlin":
@@ -271,7 +292,6 @@ Identify the 1-2 most reliable behavioral signals that distinguish Merlin from g
 These become your identification heuristics in future games.
 """
 
-    # ---- Adversarial learning block ----
     if faction == "good":
         adversarial_section = """
 ADVERSARIAL LEARNING — What evil looks for in your behavior:
@@ -293,14 +313,21 @@ ADVERSARIAL LEARNING — What good players track in your behavior:
     agent_context = _format_agent_context(state, slot_id)
     dims = config["dimensions"]
     dims_str = ", ".join(f'"{d}"' for d in dims)
-    d0 = dims[0]
-    d_last = dims[-1] if len(dims) > 1 else dims[0]
+    
+    _dim_examples = "\n    ".join(
+        f'{{"dimension": "{d}", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}}'
+        + ("," if i < len(dims) - 1 else "")
+        for i, d in enumerate(dims)
+    )
 
     system = (
         f"You are {my_name}, who played {role} ({'GOOD' if faction == 'good' else 'EVIL'} team) "
         f"in The Resistance: Avalon. Your faction {'WON' if faction_won else 'LOST'} (outcome: {outcome_tag}).\n\n"
         f"Extract SPECIFIC, ACTIONABLE lessons covering MULTIPLE dimensions. Rules:\n"
         f"- Minimum {MIN_LESSONS_PER_REFLECTION} lessons total, ideally covering all dimensions: {dims_str}\n"
+        f"- REQUIRED: at least one lesson must target a dimension OTHER than 'mistakes_to_avoid'. "
+        f"  Role-specific dimensions (like identity_concealment, merlin_identification, cover_and_deception) "
+        f"  carry more strategic value and must not be left empty.\n"
         f"- Write each lesson as a concrete reusable rule: 'When X, do Y because Z.'\n"
         f"- NO narrative. NO 'In Q2 I did X'. Write reusable rules, not game recaps.\n"
         f"- NO player names ({', '.join(all_names)}). Reference roles or behavioral patterns.\n"
@@ -314,6 +341,7 @@ ADVERSARIAL LEARNING — What good players track in your behavior:
 
     strategic_summary = _build_strategic_summary(state)
     targeted_questions = _build_role_targeted_questions(role, state, slot_id)
+    epistemic_constraints = _build_epistemic_constraints(role, state, slot_id)
 
     user = f"""
 === POST-GAME REVIEW ===
@@ -328,6 +356,8 @@ Outcome: {state.outcome} | Your faction result: {outcome_tag}
 
 === YOUR DECISIONS AND FULL GAME CONTEXT ===
 {agent_context}
+
+{epistemic_constraints}
 
 {targeted_questions}
 
@@ -346,8 +376,7 @@ Return ONLY valid JSON:
 {{
   "reasoning": "for each key decision: was it correct and what was the consequence",
   "add_tentative": [
-    {{"dimension": "{d0}", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "{d_last}", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}}
+    {_dim_examples}
   ],
   "confirm_active": [
     {{"dimension": "dimension_name", "lesson": "restated merged lesson", "keyword": "unique word from existing tentative lesson"}}
@@ -436,10 +465,6 @@ Return ONLY valid JSON:
 
 
 def _build_good_coord_prompt(state: GameState) -> tuple:
-    """
-    Build a reflection prompt for good-team coordination patterns.
-    Mirrors evil_coordination but for Merlin/Percival/LoyalServant.
-    """
     merlin_slot = state.role_to_slot.get("Merlin", -1)
     percival_slot = state.role_to_slot.get("Percival", -1)
     loyal_slot = state.role_to_slot.get("LoyalServant", -1)
@@ -523,11 +548,6 @@ Return ONLY valid JSON:
 """
     return system, user, all_names
 
-
-# ---------------------------------------------------------------------------
-# Debugging and rescue helpers
-# ---------------------------------------------------------------------------
-
 def _log_reflection_debug(game_id: int, role: str, delta: dict, applied_counts: dict):
     import json as _json
     from config import LOGS_DIR
@@ -555,8 +575,8 @@ def _log_reflection_debug(game_id: int, role: str, delta: dict, applied_counts: 
             f.write(f"  !! Only {len(tentative)} lessons returned (minimum is {MIN_LESSONS_PER_REFLECTION})\n")
 
 
+# AFTER
 def _rescue_toplevel_lesson(delta: dict) -> dict:
-    """LLM sometimes puts dimension+lesson at top level instead of inside add_tentative."""
     if not isinstance(delta, dict):
         return delta
     dim = delta.get("dimension", "").strip()
@@ -564,11 +584,10 @@ def _rescue_toplevel_lesson(delta: dict) -> dict:
     existing = delta.get("add_tentative", [])
     if dim and lesson and not existing:
         delta["add_tentative"] = [{"dimension": dim, "lesson": lesson}]
+        delta["_format_rescue"] = True  # flag for retry logic awareness
     return delta
 
-
-def _has_sufficient_lessons(delta: dict) -> bool:
-    """Return True if the delta contains the minimum required number of valid lessons."""
+def _has_sufficient_lessons(delta: dict, dims: list = None) -> bool:
     tentative = delta.get("add_tentative", [])
     valid = [
         item for item in tentative
@@ -578,44 +597,77 @@ def _has_sufficient_lessons(delta: dict) -> bool:
         and "<" not in item.get("dimension", "")
         and "<" not in item.get("lesson", "")
     ]
-    return len(valid) >= MIN_LESSONS_PER_REFLECTION
-
+    if len(valid) < MIN_LESSONS_PER_REFLECTION:
+        return False
+    # Require at least 2 distinct dimensions — prevents all lessons collapsing into one bucket
+    dims_used = {item["dimension"].strip().lower() for item in valid}
+    catchall = {"mistakes_to_avoid"}
+    non_catchall = dims_used - catchall
+    # Accept if: ≥2 distinct dims used, OR at least 1 non-catchall dim present when dims provided
+    if dims:
+        role_specific = {d.strip().lower() for d in dims} - catchall
+        if non_catchall & role_specific:
+            return True
+    return len(dims_used) >= 2
 
 def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id: int) -> dict:
-    """
-    Call the LLM for reflection with retry logic if the response contains
-    fewer than MIN_LESSONS_PER_REFLECTION valid lessons.
-    """
+    config = ROLES_CONFIG[role]
+    dims = config["dimensions"]
+    dims_str = ", ".join(f'"{d}"' for d in dims)
+    last_delta = {}
+
     for attempt in range(MAX_REFLECTION_RETRIES + 1):
-        delta = call_llm_json(llm, system, user, call_label=f"reflection {role} (attempt {attempt+1})")
+        effective_user = user if attempt == 0 else (
+            user
+            + f"\n\n⚠️ RETRY ATTEMPT {attempt}: Your previous response did not meet requirements.\n"
+            f"You MUST return at least {MIN_LESSONS_PER_REFLECTION} lessons spread across at least "
+            f"2 of these dimensions: {dims_str}.\n"
+            f"Do NOT put all lessons in 'mistakes_to_avoid'. Each dimension listed in the template "
+            f"requires its own distinct, actionable lesson.\n"
+            f"Return ONLY valid JSON matching the schema above — no prose outside the JSON object."
+        )
+        delta = call_llm_json(
+            llm, system, effective_user,
+            call_label=f"reflection {role} (attempt {attempt + 1})"
+        )
         if not isinstance(delta, dict):
             continue
         delta = _rescue_toplevel_lesson(delta)
-        if _has_sufficient_lessons(delta):
+        if delta.get("_format_rescue"):
+            last_delta = delta
+            continue
+        last_delta = delta
+        if _has_sufficient_lessons(delta, dims):
             return delta
-        # Retry with explicit reminder
-        retry_note = (
-            f"\n\nIMPORTANT: Your previous response only contained "
-            f"{len(delta.get('add_tentative', []))} lesson(s). "
-            f"You must provide at least {MIN_LESSONS_PER_REFLECTION} lessons across different dimensions. "
-            "Every dimension listed must have at least one lesson."
-        )
-        user = user + retry_note
 
-    # Return whatever we have after exhausting retries
+    return last_delta
+
     return delta if isinstance(delta, dict) else {}
 
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+def _log_coord_reflection_debug(label: str, game_id: int, delta: dict):
+    import json as _json
+    from config import LOGS_DIR
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    path = os.path.join(LOGS_DIR, "reflection_debug.log")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"GAME {game_id:03d} | {label}\n")
+        if not delta:
+            f.write("  !! coord delta was None or empty — apply skipped\n")
+            return
+        f.write(f"RAW DELTA: {_json.dumps(delta, ensure_ascii=False)}\n")
+        tentative = delta.get("add_tentative", [])
+        f.write(f"add_tentative ({len(tentative)} items):\n")
+        for item in tentative:
+            dim = item.get("dimension", "MISSING") if isinstance(item, dict) else "INVALID"
+            lesson = item.get("lesson", "MISSING") if isinstance(item, dict) else str(item)
+            f.write(f"  dim={dim!r} lesson={lesson[:80]!r}\n")
+        if not tentative:
+            f.write("  !! LLM returned empty add_tentative for coord reflection\n")
 
 def run_reflection(state: GameState, llm) -> dict:
     counts = {}
 
-    # ------------------------------------------------------------------
-    # Phase 1: Individual role reflections
-    # ------------------------------------------------------------------
     for role in ALL_ROLES:
         slot_id = state.role_to_slot[role]
         system, user, names = _build_reflection_prompt(role, state, slot_id)
@@ -638,24 +690,22 @@ def run_reflection(state: GameState, llm) -> dict:
             counts[role] = {"tentative": 0, "confirmed": 0, "deprecated": 0}
             _log_reflection_debug(state.game_id, role, {}, {})
 
-    # ------------------------------------------------------------------
-    # Phase 2: Evil faction coordination reflection (Assassin + Morgana only)
-    # ------------------------------------------------------------------
     system, user, names = _build_evil_coord_prompt(state)
     coord_delta = call_llm_json(llm, system, user, call_label="evil coord reflection")
-    if coord_delta and isinstance(coord_delta, dict):
-        coord_delta = _rescue_toplevel_lesson(coord_delta)
-        coord_delta = _sanitize_delta(coord_delta, names)
+    coord_delta = coord_delta if isinstance(coord_delta, dict) else {}
+    coord_delta = _rescue_toplevel_lesson(coord_delta)
+    coord_delta = _sanitize_delta(coord_delta, names)
+    _log_coord_reflection_debug("evil_coord", state.game_id, coord_delta)
+    if coord_delta.get("add_tentative"):
         apply_evil_coord_delta(coord_delta, state.game_id)
 
-    # ------------------------------------------------------------------
-    # Phase 3: Good faction coordination reflection (Merlin + Percival + LoyalServant only)
-    # ------------------------------------------------------------------
     system, user, names = _build_good_coord_prompt(state)
     good_coord_delta = call_llm_json(llm, system, user, call_label="good coord reflection")
-    if good_coord_delta and isinstance(good_coord_delta, dict):
-        good_coord_delta = _rescue_toplevel_lesson(good_coord_delta)
-        good_coord_delta = _sanitize_delta(good_coord_delta, names)
+    good_coord_delta = good_coord_delta if isinstance(good_coord_delta, dict) else {}
+    good_coord_delta = _rescue_toplevel_lesson(good_coord_delta)
+    good_coord_delta = _sanitize_delta(good_coord_delta, names)
+    _log_coord_reflection_debug("good_coord", state.game_id, good_coord_delta)
+    if good_coord_delta.get("add_tentative"):
         apply_good_coord_delta(good_coord_delta, state.game_id)
 
     return counts

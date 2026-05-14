@@ -33,11 +33,12 @@ class GameEngine:
 
     def _system(self, role: str, state: GameState) -> str:
         if role not in self._system_cache:
+            agent_name = state.slot_to_name[state.role_to_slot[role]]
             special_info = self._build_special_info(role, state)
             lessons = load_lessons(role)
             evil_coord = load_evil_coord() if ROLES_CONFIG[role]["faction"] == "evil" else ""
             good_coord = load_good_coord() if ROLES_CONFIG[role]["faction"] == "good" else ""
-            self._system_cache[role] = build_system_prompt(role, special_info, lessons, evil_coord, good_coord)
+            self._system_cache[role] = build_system_prompt(role, agent_name, special_info, lessons, evil_coord, good_coord)
         return self._system_cache[role]
 
     def _build_special_info(self, role: str, state: GameState) -> str:
