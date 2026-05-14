@@ -107,4 +107,12 @@ EVIL_COORD_DIMENSIONS = [
     "blame_deflection",
 ]
 
+GOOD_COORD_DIMENSIONS = [
+    "merlin_signal_protection",
+    "evil_identification_coordination",
+    "team_composition_alignment",
+    "vote_coordination",
+    "merlin_concealment_support",
+]
+
 ALL_ROLES = list(ROLES_CONFIG.keys())

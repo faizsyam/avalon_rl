@@ -113,6 +113,78 @@ def _format_agent_context(state: GameState, slot_id: int) -> str:
 # Prompt builders
 # ---------------------------------------------------------------------------
 
+def _build_strategic_summary(state: GameState) -> str:
+    evil_slots = {state.role_to_slot.get("Assassin"), state.role_to_slot.get("Morgana")}
+    lines = ["POST-GAME STRATEGIC FACTS:"]
+    evil_access_count = 0
+    for m in state.mission_history:
+        evil_on = [s for s in m.team if s in evil_slots]
+        if evil_on:
+            evil_access_count += 1
+        access = f"evil present: {[_n(state, s) for s in evil_on]}" if evil_on else "no evil on team"
+        lines.append(f"  Q{m.quest_num}: {[_n(state, s) for s in m.team]} → {m.result} ({access})")
+    total = len(state.mission_history)
+    lines.append(f"  Evil had team access on {evil_access_count}/{total} quests, caused {state.evil_wins} quest fail(s).")
+    if state.evil_wins == 0 and total > 0:
+        lines.append("  !! Evil failed ZERO quests — every evil card played was SUCCESS. Evil cannot win this way.")
+    if state.assassin_guess_slot is not None:
+        guess_name = _n(state, state.assassin_guess_slot)
+        merlin_name = _n(state, state.role_to_slot.get("Merlin", -1))
+        lines.append(f"  Assassin guessed {guess_name}. Merlin was {merlin_name}. Correct: {state.assassin_correct}")
+    return "\n".join(lines)
+
+
+def _build_role_targeted_questions(role: str, state: GameState, slot_id: int) -> str:
+    config = ROLES_CONFIG[role]
+    faction = config["faction"]
+    evil_slots = {state.role_to_slot.get("Assassin"), state.role_to_slot.get("Morgana")}
+    my_missions = [m for m in state.mission_history if slot_id in m.team]
+    total = len(state.mission_history)
+
+    if faction == "evil":
+        lines = [f"TARGETED QUESTIONS FOR {role.upper()}:"]
+        lines.append(f"  You appeared on {len(my_missions)}/{total} quest teams.")
+        if state.evil_wins == 0:
+            lines.append("  Evil sabotaged zero quests. For each mission you played SUCCESS: was that the right call?")
+            lines.append("  If you never had team access: why not, and what could you have done differently in votes/discussion?")
+        elif state.evil_wins < 3:
+            lines.append(f"  Evil needed 3 quest fails to win but only achieved {state.evil_wins}. What prevented the remaining fails?")
+        return "\n".join(lines)
+
+    elif role == "Merlin":
+        lines = ["TARGETED QUESTIONS FOR MERLIN:"]
+        if state.assassin_correct:
+            lines.append("  You were assassinated. Which statements or votes could only be explained by hidden knowledge?")
+        else:
+            lines.append("  You survived the Assassin's guess. What concealment choices protected you?")
+        evil_proposals = [
+            f"Q{v.quest_num}P{v.proposal_num}: included {[_n(state, s) for s in v.proposed_team if s in evil_slots]}"
+            for v in state.vote_history
+            if v.proposer_slot == slot_id and any(s in evil_slots for s in v.proposed_team)
+        ]
+        if evil_proposals:
+            lines.append(f"  You proposed teams containing evil players: {evil_proposals} — was this justified?")
+        return "\n".join(lines)
+
+    elif role == "Percival":
+        merlin_slot = state.role_to_slot.get("Merlin")
+        morgana_slot = state.role_to_slot.get("Morgana")
+        lines = [
+            "TARGETED QUESTIONS FOR PERCIVAL:",
+            f"  Real Merlin was {_n(state, merlin_slot)}, Morgana was {_n(state, morgana_slot)}.",
+            "  Did you correctly distinguish them? Did your behavior protect or expose Merlin?",
+        ]
+        return "\n".join(lines)
+
+    else:
+        evil_names = [_n(state, s) for s in evil_slots]
+        lines = [
+            f"TARGETED QUESTIONS FOR {role.upper()}:",
+            f"  Evil players were {evil_names}.",
+            "  How early could observable evidence have identified them? What patterns did you miss or catch?",
+        ]
+        return "\n".join(lines)
+        
 def _build_reflection_prompt(role: str, state: GameState, slot_id: int) -> tuple:
     config = ROLES_CONFIG[role]
     faction = config["faction"]
@@ -240,10 +312,14 @@ ADVERSARIAL LEARNING — What good players track in your behavior:
         f"- Evil team reminder: approving a quest with no evil players guarantees a good quest win."
     )
 
+    strategic_summary = _build_strategic_summary(state)
+    targeted_questions = _build_role_targeted_questions(role, state, slot_id)
+
     user = f"""
 === POST-GAME REVIEW ===
 Outcome: {state.outcome} | Your faction result: {outcome_tag}
 {full_role_reveal}
+{strategic_summary}
 {mission_log}
 {vote_log}
 {assassin_reveal}
@@ -252,6 +328,8 @@ Outcome: {state.outcome} | Your faction result: {outcome_tag}
 
 === YOUR DECISIONS AND FULL GAME CONTEXT ===
 {agent_context}
+
+{targeted_questions}
 
 Write {MIN_LESSONS_PER_REFLECTION}-5 strategic lessons for the {role} role, split across these dimensions: {dims_str}.
 Use the FULL DISCUSSION LOG above to identify behavioral patterns and tells — not just quest outcomes.
@@ -345,8 +423,10 @@ Dimensions: covering_for_each_other, vote_synchronization, mission_sabotage_timi
 Return ONLY valid JSON:
 {{
   "add_tentative": [
+    {{"dimension": "covering_for_each_other", "lesson": "When [situation], do [action] because [reason]. (observed on {outcome_tag})"}},
     {{"dimension": "vote_synchronization", "lesson": "When [situation], do [action] because [reason]. (observed on {outcome_tag})"}},
-    {{"dimension": "mission_sabotage_timing", "lesson": "When [situation], do [action] because [reason]. (observed on {outcome_tag})"}}
+    {{"dimension": "mission_sabotage_timing", "lesson": "When [situation], do [action] because [reason]. (observed on {outcome_tag})"}},
+    {{"dimension": "blame_deflection", "lesson": "When [situation], do [action] because [reason]. (observed on {outcome_tag})"}}
   ],
   "confirm_active": [],
   "flag_deprecated": []
@@ -432,7 +512,10 @@ Return ONLY valid JSON:
 {{
   "add_tentative": [
     {{"dimension": "merlin_signal_protection", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "evil_identification_coordination", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}}
+    {{"dimension": "evil_identification_coordination", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}},
+    {{"dimension": "team_composition_alignment", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}},
+    {{"dimension": "vote_coordination", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}},
+    {{"dimension": "merlin_concealment_support", "lesson": "When X, do Y because Z. (observed on {outcome_tag})"}}
   ],
   "confirm_active": [],
   "flag_deprecated": []
@@ -561,6 +644,7 @@ def run_reflection(state: GameState, llm) -> dict:
     system, user, names = _build_evil_coord_prompt(state)
     coord_delta = call_llm_json(llm, system, user, call_label="evil coord reflection")
     if coord_delta and isinstance(coord_delta, dict):
+        coord_delta = _rescue_toplevel_lesson(coord_delta)
         coord_delta = _sanitize_delta(coord_delta, names)
         apply_evil_coord_delta(coord_delta, state.game_id)
 
@@ -570,6 +654,7 @@ def run_reflection(state: GameState, llm) -> dict:
     system, user, names = _build_good_coord_prompt(state)
     good_coord_delta = call_llm_json(llm, system, user, call_label="good coord reflection")
     if good_coord_delta and isinstance(good_coord_delta, dict):
+        good_coord_delta = _rescue_toplevel_lesson(good_coord_delta)
         good_coord_delta = _sanitize_delta(good_coord_delta, names)
         apply_good_coord_delta(good_coord_delta, state.game_id)
 

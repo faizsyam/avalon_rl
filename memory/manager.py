@@ -2,7 +2,7 @@ import os
 from typing import Dict, List, Optional
 
 from config import LESSONS_DIR, EVIL_COORD_FILE
-from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, ALL_ROLES
+from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, GOOD_COORD_DIMENSIONS, ALL_ROLES
 
 # ---------------------------------------------------------------------------
 # Good-team coordination file — mirrors evil_coordination for Merlin/Percival/LoyalServant
@@ -52,7 +52,6 @@ def _init_evil_coord() -> str:
     }, EVIL_COORD_DIMENSIONS)
     _write(EVIL_COORD_FILE, content)
     return content
-
 
 def _init_good_coord() -> str:
     content = _serialize({
@@ -218,17 +217,13 @@ def load_evil_coord() -> str:
 
 
 def load_good_coord() -> str:
-    """Load good team coordination memory, separated by confidence tier."""
+    from config import GOOD_COORD_FILE
     if not os.path.exists(GOOD_COORD_FILE):
         _init_good_coord()
         return ""
-
     content = open(GOOD_COORD_FILE, "r", encoding="utf-8").read()
     parsed = _parse(content, GOOD_COORD_DIMENSIONS)
-
-    active_lines: List[str] = []
-    tentative_lines: List[str] = []
-
+    active_lines, tentative_lines = [], []
     for dim in GOOD_COORD_DIMENSIONS:
         d = parsed["dimensions"][dim]
         if d["active"]:
@@ -237,19 +232,15 @@ def load_good_coord() -> str:
         if d["tentative"]:
             tentative_lines.append(f"[{dim}]")
             tentative_lines.extend(d["tentative"])
-
-    output: List[str] = []
+    output = []
     if active_lines:
         output.append("CONFIRMED:")
         output.extend(active_lines)
     if tentative_lines:
-        if output:
-            output.append("")
+        output.append("")
         output.append("PROVISIONAL:")
         output.extend(tentative_lines)
-
     return "\n".join(output)
-
 
 # ---------------------------------------------------------------------------
 # Delta application helpers
