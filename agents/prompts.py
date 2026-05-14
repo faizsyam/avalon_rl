@@ -686,8 +686,6 @@ def get_vote_prompt(state, slot_id: int, proposer_slot: int, proposed_team: List
         ally_role = "Morgana" if role == "Assassin" else "Assassin"
         ally_slot = state.role_to_slot[ally_role]
         ally_name = _n(state, ally_slot)
-        evil_on_team = [_n(state, s) for s in proposed_team if s in {my_slot if role == "Assassin" else state.role_to_slot["Morgana"], ally_slot}]
-        # Simplify: just note which evil are on the team
         evil_present = [s for s in proposed_team if s in {slot_id, ally_slot}]
         evil_present_names = [_n(state, s) for s in evil_present]
         if evil_present_names:
