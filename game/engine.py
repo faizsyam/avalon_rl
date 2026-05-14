@@ -14,7 +14,7 @@ from agents.prompts import (
     get_assassin_prompt,
 )
 from agents.llm_client import call_llm_json
-from memory.manager import load_lessons, load_evil_coord
+from memory.manager import load_lessons, load_evil_coord, load_good_coord
 from storage.printer import (
     print_game_header, print_quest_header, print_discussion_header,
     print_statement, print_proposal_header, print_proposal,
@@ -22,18 +22,23 @@ from storage.printer import (
     print_mission_header, print_mission_private, print_mission_result,
     print_score, print_assassin_phase, print_assassin_guess,
     print_outcome, print_five_proposals_auto,
+    DIM, RESET,
 )
 
 
 class GameEngine:
     def __init__(self, llm):
         self.llm = llm
+        self._system_cache: Dict[str, str] = {}
 
     def _system(self, role: str, state: GameState) -> str:
-        special_info = self._build_special_info(role, state)
-        lessons = load_lessons(role)
-        evil_coord = load_evil_coord() if ROLES_CONFIG[role]["faction"] == "evil" else ""
-        return build_system_prompt(role, special_info, lessons, evil_coord)
+        if role not in self._system_cache:
+            special_info = self._build_special_info(role, state)
+            lessons = load_lessons(role)
+            evil_coord = load_evil_coord() if ROLES_CONFIG[role]["faction"] == "evil" else ""
+            good_coord = load_good_coord() if ROLES_CONFIG[role]["faction"] == "good" else ""
+            self._system_cache[role] = build_system_prompt(role, special_info, lessons, evil_coord, good_coord)
+        return self._system_cache[role]
 
     def _build_special_info(self, role: str, state: GameState) -> str:
         template = ROLES_CONFIG[role]["special_info_template"]
@@ -66,6 +71,7 @@ class GameEngine:
         state = GameState(game_id=game_id)
         roles = ALL_ROLES.copy()
         random.shuffle(roles)
+        self._system_cache = {}
         for slot, role in enumerate(roles):
             state.slot_to_role[slot] = role
             state.role_to_slot[role] = slot
@@ -150,8 +156,6 @@ class GameEngine:
                 approved_team = team
                 break
 
-            # Post-rejection reactive discussion
-            from storage.printer import DIM, RESET
             print(f"\n  {DIM}[Reactions to rejected proposal...]{RESET}")
             self._run_rejection_discussion(state, team, record)
 
@@ -259,6 +263,7 @@ class GameEngine:
     def _run_rejection_discussion(self, state: GameState, rejected_team: list, vote_record):
         state.log_lines.append("\n[REJECTION REACTION]")
         order = list(range(5))
+        random.shuffle(order)
         for slot in order:
             role = state.slot_to_role[slot]
             result = call_llm_json(
@@ -285,6 +290,15 @@ class GameEngine:
             role = state.slot_to_role[slot]
             if not ROLES_CONFIG[role]["can_fail_mission"]:
                 cards.append("SUCCESS")
+                result = call_llm_json(
+                    self.llm,
+                    self._system(role, state),
+                    get_mission_prompt(state, slot, role, team),
+                    call_label=f"mission Q{state.quest_num} Slot{slot}",
+                )
+                internal = result.get("internal_note", "").strip()
+                if internal:
+                    self._append_note(state, slot, f"[Q{state.quest_num} Mission] {internal}")
             else:
                 result = call_llm_json(
                     self.llm,
@@ -329,6 +343,8 @@ class GameEngine:
         state.log_lines.append("\n--- ASSASSIN'S CHOICE ---")
         print_assassin_phase(assassin_slot, "Assassin", state.slot_to_name)
 
+        lessons = load_lessons("Assassin")
+        evil_coord = load_evil_coord()
         result = call_llm_json(
             self.llm,
             self._system("Assassin", state),

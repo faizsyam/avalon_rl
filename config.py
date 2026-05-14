@@ -7,9 +7,8 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 MODEL_NAME = os.getenv("MODEL_NAME", "meta/llama-3.1-70b-instruct")
 
-# Token budgets — gameplay needs room for context + notes output; reflection needs room for full log analysis
-GAMEPLAY_MAX_TOKENS = 2048
-REFLECTION_MAX_TOKENS = 4096
+GAMEPLAY_MAX_TOKENS = 32768
+REFLECTION_MAX_TOKENS = 32768
 
 # Early consolidation schedule: run at these specific game numbers, then every CONSOLIDATION_EVERY after
 EARLY_CONSOLIDATION_GAMES = [5, 10]
@@ -34,5 +33,3 @@ CHECKPOINTS_DIR = os.path.join(DATA_DIR, "checkpoints")
 METRICS_FILE = os.path.join(DATA_DIR, "metrics.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 EVIL_COORD_FILE = os.path.join(LESSONS_DIR, "evil_coordination.txt")
-
-PUBLIC_LESSONS_DIR = 'data/public_lessons'

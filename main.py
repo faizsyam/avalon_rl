@@ -8,7 +8,6 @@ from config import (
     LESSONS_DIR,
     LOGS_DIR,
     CHECKPOINTS_DIR,
-    PUBLIC_LESSONS_DIR,
 )
 from game.engine import GameEngine
 from agents.llm_client import create_llm, create_reflection_llm
@@ -33,10 +32,10 @@ from storage.printer import (
     BOLD, YELLOW, RESET, DIM,
 )
 from game.roles import ALL_ROLES
-
+from memory.manager import should_consolidate_now
 
 def run():
-    for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR, PUBLIC_LESSONS_DIR]:
+    for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR]:
         os.makedirs(d, exist_ok=True)
     ensure_dirs()
 
@@ -61,7 +60,8 @@ def run():
         print_reflection_header()
         deltas = run_reflection(state, reflection_llm)
         for role, n in (deltas or {}).items():
-            print_reflection_role(role, n)
+            total = n["tentative"] + n["confirmed"] + n["deprecated"] if isinstance(n, dict) else n
+            print_reflection_role(role, total)
 
         snapshot_lessons(metrics, game_id)
         save_metrics(metrics)
@@ -72,7 +72,8 @@ def run():
 
         should_consolidate = (
             game_id in EARLY_CONSOLIDATION_GAMES or
-            (game_id > max(EARLY_CONSOLIDATION_GAMES, default=0) and game_id % CONSOLIDATION_EVERY == 0)
+            (game_id > max(EARLY_CONSOLIDATION_GAMES, default=0) and game_id % CONSOLIDATION_EVERY == 0) or
+            should_consolidate_now()
         )
         if should_consolidate:
             print_consolidation()
