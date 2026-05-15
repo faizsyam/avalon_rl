@@ -220,7 +220,7 @@ def _resolve_dim(parsed_dims: dict, raw_dim: str) -> Optional[str]:
     return None
 
 
-def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 6) -> bool:
+def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 12) -> bool:
     new_words = set(new_lesson.lower().split())
     for existing in existing_lessons:
         existing_words = set(existing.lower().split())

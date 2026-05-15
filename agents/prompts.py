@@ -163,11 +163,17 @@ Role-aware reasoning belongs only in private_note or internal_note.
 Speak naturally like a real player at a tense table:
 - address yourself by 'I' or 'me', not using your name,
 - address other players by name,
-- react to specific statements,
-- base public reasoning on observable evidence only:
-  mission outcomes, votes, and player behavior.
+- react to specific statements
+
+Observable evidence you MUST use publicly:
+- Mission outcomes: who was on which failed quest, how many fail cards
+- Vote patterns: who approved or rejected which proposals
+- Behavioral consistency: who changed position, who deflected, who pushed for risky teams
+
+Quest failures are public events. Citing them as grounds for accusations or defenses is valid public reasoning.
 
 Be expressive and show emotion when appropriate.
+Be active when needed: accuse, challenge, question.
 Every public statement and expression should advance your objective.
 """
 
@@ -248,9 +254,10 @@ def _dynamic_priority_block(role: str, state) -> str:
             lines.append(
                 "Good is ONE quest win away. Any quest success ends the quest phase and forces the "
                 "Assassin's guess — which is NOT a guaranteed evil win. "
-                "Suggest to vote reject any proposed team that contains neither Assassin nor Morgana — a clean team "
-                "guarantees a good quest win. Find a credible public reason to REJECT. "
-                "Intensify behavioral observation: who is steering teams with accuracy they cannot justify?"
+                "REJECT any proposed team that contains neither Assassin nor Morgana — a clean team "
+                "guarantees a good quest win and you cannot allow it. "
+                "Find a credible public reason to REJECT. "
+                "Intensify observation: who is steering teams with accuracy they cannot justify?"
             )
         elif e == 2:
             lines.append(
@@ -268,11 +275,10 @@ def _dynamic_priority_block(role: str, state) -> str:
             )
         if e == 2:
             lines.append(
-                "Evil is ONE failed quest from winning outright. A single FAIL card ends the game "
-                "immediately — there is no recovery. The team must be guaranteed clean: only players "
-                "whose alignment has been confirmed good by your judgement. "
-                "Suggest to vote REJECT any proposal containing unproven players regardless of stated reasoning. "
-                "Experimentation and 'gathering data' are losing strategies at this score."
+                "🚨 Evil is ONE failed quest from winning outright. A single FAIL card ends the game.\n"
+                "REJECT any proposal containing players who have appeared on failed quests or who are unproven.\n"
+                "'Testing combinations' and 'gathering data' are how evil wins at this score — do not use them as arguments.\n"
+                "Only approve teams where every member's alignment is confirmed by quest history."
             )
 
     lines.append(f"Current quest: Q{q}/5.")
@@ -292,7 +298,8 @@ def build_system_prompt(role: str, agent_name:str, special_info: str, lessons: s
     return (
         f"{GAME_RULES}\n"
         f"YOUR NAME: {agent_name}\n"
-        f"Never address yourself as {agent_name}, instead use 'I' or 'me'.\n"
+        f"* Never address yourself as {agent_name}, instead use 'I' or 'me'.\n"
+        f"YOUR FACTION: {config["faction"]}\n"
         f"YOUR PRIVATE INFORMATION:\n{special_info}\n"
         f"{role_ctx}"
         f"{OPSEC_DIRECTIVE}\n"
@@ -326,7 +333,7 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         safe_names = [state.slot_to_name[s] for s in range(5) if s not in evil_slots]
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
-            f"  You are {my_name}. You are good and confirmed safe.\n"
+            f"  You are {my_name}. You part of the good team.\n"
             f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
             f"  Evil players: {evil_names} — any mission team containing either of them can be sabotaged.\n"
             f"  Safe players (you + all non-evil): {safe_names}\n"
@@ -337,8 +344,9 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
         candidates = sorted([state.slot_to_name[state.role_to_slot[r]] for r in ["Merlin", "Morgana"]])
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
-            f"  You are {my_name}. You are good and confirmed safe.\n"
+            f"  You are {my_name}. You part of the good team.\n"
             f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
+            f"  Your goal is to succeed 3 quests amongst the 5 quest given by not letting a single evil team join a quest.\n"
             f"  {candidates[0]} and {candidates[1]} both appear as Merlin — one is real Merlin (good), one is Morgana (evil).\n"
             f"  Observe who steers accurately without observable basis — that is real Merlin."
         )
@@ -348,10 +356,11 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
                          if s not in {my_slot, state.role_to_slot["Morgana"]}]
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
-            f"  You are {my_name}. You are evil.\n"
+            f"  You are {my_name}. You are part of the evil team.\n"
             f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
-            f"  {ally} is Morgana, your evil ally. All others ({safe_from_evil}) are good.\n"
-            f"  Either of you alone on a mission can play FAIL independently — you do not need to be together.\n"
+            f"  {ally} is Morgana, your evil ally. All others ({safe_from_evil}) are part of the good team (your opponent).\n"
+            f"  Your goal is to fail 3 quests amongst the 5 quests given\n"
+            f"  Either of you or {ally} alone on a mission can play FAIL independently on a quest — you do not need to be together.\n"
             f"  Only ONE FAIL card is needed to fail an entire quest."
         )
     elif role == "Morgana":
@@ -360,10 +369,11 @@ def _build_role_knowledge_reminder(state, my_slot: int) -> str:
                          if s not in {my_slot, state.role_to_slot["Assassin"]}]
         return (
             f"YOUR HIDDEN KNOWLEDGE:\n"
-            f"  You are {my_name}. You are evil.\n"
+            f"  You are {my_name}. You are part of the evil team.\n"
             f"  Never address yourself as {my_name}, instead use 'I' or 'me'.\n"
-            f"  {ally} is the Assassin, your evil ally. All others ({safe_from_evil}) are good.\n"
-            f"  Either of you alone on a mission can play FAIL independently — you do not need to be together.\n"
+            f"  {ally} is the Assassin, your evil ally. All others ({safe_from_evil}) are part of the good team (your opponent).\n"
+            f"  Your goal is to fail 3 quests amongst the 5 quests given\n"
+            f"  Either of you or {ally} alone on a mission can play FAIL independently on a quest — you do not need to be together.\n"
             f"  Only ONE FAIL card is needed to fail an entire quest."
         )
     return ""
@@ -501,6 +511,9 @@ def _build_game_context(state, my_slot: int) -> str:
     deductions = _build_mission_deductions(state, my_slot)
     if deductions:
         parts += [deductions, ""]
+    cev = _build_confirmed_evil_players(state, my_slot)
+    if cev:
+        parts += [cev, ""]
     mh = _build_quest_roadmap(state, my_slot)
     if mh:
         parts += [mh, ""]
@@ -542,6 +555,35 @@ def _build_quest_roadmap(state, my_slot: int) -> str:
             lines.append(f"  Q{q} ({size} players): ← CURRENT (proposal {proposal_count + 1}/5)")
         else:
             lines.append(f"  Q{q} ({size} players): upcoming")
+    
+    role = state.slot_to_role[my_slot]
+    faction = ROLES_CONFIG[role]["faction"]
+    confirmed = _get_confirmed_evil_names(state)
+    suspicious = _get_high_suspicion_names(state)
+    fail_teams = [set(m.team) for m in state.mission_history if m.result == "FAIL"]
+
+    if faction == "good":
+        if len(fail_teams) >= 2:
+            common = fail_teams[0].intersection(*fail_teams[1:])
+            common_names = [_n(state, s) for s in common]
+            if common_names:
+                lines.append(f"  ⚠ CROSS-QUEST: {common_names} present on EVERY failed quest — treat as evil.")
+        if confirmed:
+            lines.append(f"  ✗ CONFIRMED EVIL: {confirmed} — exclude from all future teams.")
+        if suspicious:
+            lines.append(f"  ? HIGH SUSPICION: {suspicious} — 2+ failed quests, likely evil.")
+    else:  # evil
+        evil_slots = {state.role_to_slot["Assassin"], state.role_to_slot["Morgana"]}
+        evil_names = {state.slot_to_name[s] for s in evil_slots}
+        if confirmed:
+            exposed = [n for n in confirmed if n in evil_names]
+            if exposed:
+                lines.append(f"  ✗ COVER LOST: {exposed} are publicly confirmed evil — the group will block them.")
+        if suspicious:
+            suspected_evil = [n for n in suspicious if n in evil_names]
+            if suspected_evil:
+                lines.append(f"  ? GROUP SUSPECTS: {suspected_evil} — redirect their suspicion onto innocents now.")
+
     return "\n".join(lines)
 
 def _build_leader_rotation(state) -> str:
@@ -568,6 +610,69 @@ def _build_player_quest_summary(state) -> str:
         lines.append(f"  {name}: {' '.join(quests) if quests else 'no quests yet'}")
     return "\n".join(lines)
 
+def _get_confirmed_evil_names(state) -> list[str]:
+    """Players mathematically confirmed evil: N fails on N-person team."""
+    confirmed = set()
+    for m in state.mission_history:
+        if m.result == "FAIL" and m.num_fails == len(m.team):
+            confirmed.update(_n(state, s) for s in m.team)
+    return sorted(confirmed)
+
+
+def _get_high_suspicion_names(state) -> list[str]:
+    """Players appearing in 2+ distinct failed quests, not already confirmed."""
+    confirmed = set(_get_confirmed_evil_names(state))
+    fail_count: dict[str, int] = {}
+    for m in state.mission_history:
+        if m.result == "FAIL":
+            for s in m.team:
+                name = _n(state, s)
+                if name not in confirmed:
+                    fail_count[name] = fail_count.get(name, 0) + 1
+    return sorted(n for n, c in fail_count.items() if c >= 2)
+
+
+def _build_confirmed_evil_players(state, my_slot: int) -> str:
+    role = state.slot_to_role[my_slot]
+    faction = ROLES_CONFIG[role]["faction"]
+    confirmed = _get_confirmed_evil_names(state)
+    suspicious = _get_high_suspicion_names(state)
+    if not confirmed and not suspicious:
+        return ""
+
+    if faction == "good":
+        lines = ["DEDUCTION SUMMARY — ACT ON THIS:"]
+        if confirmed:
+            lines.append(f"  CONFIRMED EVIL (mathematical proof): {confirmed}")
+            lines.append(f"    → Never include them on any team. Name them as evil in discussion — the math is public.")
+        if suspicious:
+            lines.append(f"  HIGH SUSPICION (2+ failed quests): {suspicious}")
+            lines.append(f"    → Exclude from teams. Challenge them by name publicly.")
+
+    else:  # evil
+        evil_slots = {state.role_to_slot["Assassin"], state.role_to_slot["Morgana"]}
+        evil_names = {state.slot_to_name[s] for s in evil_slots}
+        lines = ["WHAT THE GROUP NOW KNOWS (derived from public quest math):"]
+        if confirmed:
+            exposed_evil = [n for n in confirmed if n in evil_names]
+            exposed_innocent = [n for n in confirmed if n not in evil_names]
+            if exposed_evil:
+                lines.append(f"  YOUR COVER IS BLOWN: {exposed_evil} are publicly confirmed evil.")
+                lines.append(f"    → Mission access for {exposed_evil} is effectively over.")
+                lines.append(f"    → Immediately redirect blame onto innocent teammates from those failed quests.")
+            if exposed_innocent:
+                lines.append(f"  Innocents the group wrongly confirmed as evil: {exposed_innocent} — useful misdirection, do not correct it.")
+        if suspicious:
+            suspected_evil = [n for n in suspicious if n in evil_names]
+            suspected_innocent = [n for n in suspicious if n not in evil_names]
+            if suspected_evil:
+                lines.append(f"  GROUP SUSPECTS YOU OR YOUR ALLY: {suspected_evil}")
+                lines.append(f"    → Defend indirectly. Loudly redirect suspicion toward innocent players by name.")
+            if suspected_innocent:
+                lines.append(f"  Group suspects innocents: {suspected_innocent} — do not defend them. Let that suspicion grow.")
+
+    return "\n".join(lines)
+
 def get_discussion_prompt(state, slot_id: int) -> str:
     role = state.slot_to_role[slot_id]
     priority = _dynamic_priority_block(role, state)
@@ -576,27 +681,59 @@ def get_discussion_prompt(state, slot_id: int) -> str:
     prior_statements = [d for d in state.discussion_log if d.quest_num == state.quest_num]
     proposal_count = len([v for v in state.vote_history if v.quest_num == state.quest_num])
     faction = ROLES_CONFIG[role]["faction"]
+    confirmed = _get_confirmed_evil_names(state)
+    suspicious = _get_high_suspicion_names(state)
+
     if faction == "evil":
         goal = (
-            "Your actual interest is getting yourself or your evil ally onto this quest team. "
-            "Advocate for team compositions that serve this — but frame your reasoning in terms "
-            "the group finds credible. Suspicion narrows your access; credibility expands it."
+            "Your interest is getting yourself or your evil ally onto this quest team.\n"
+            "  - Frame all advocacy in terms the group finds credible.\n"
+            "  - If suspicion is forming around you or your ally, immediately counter-accuse "
+            "an innocent player by name — redirect before the group locks in.\n"
+            "  - If you were on a failed quest, blame your innocent teammates specifically.\n"
+            "  - Do not wait to be accused. Offense is your best defense."
         )
     else:
+        accusation = ""
+        if confirmed:
+            accusation += (
+                f"\n  ACTION REQUIRED: {confirmed} are mathematically confirmed evil from quest results. "
+                f"Name them directly. Demand they are excluded. Do not soften this."
+            )
+        if suspicious:
+            accusation += (
+                f"\n  ACTION REQUIRED: {suspicious} appeared on multiple failed quests. "
+                f"Challenge them by name — ask them to explain it. Do not let it pass."
+            )
         goal = (
-            "Your goal is to identify a team with no evil players. "
-            "Use quest outcomes, vote patterns, and behavioral consistency as evidence. "
-            "A failed quest proves evil presence; a succeeded quest proves nothing about individual alignment."
+            "Your goal is to get a clean mission team — no evil players.\n"
+            "  - A failed quest is NOT data. It is a point for evil. Treat it accordingly.\n"
+            "  - 'Let's test them and see' is only valid when evil cannot win from one more fail. "
+            "Check the score before using that argument.\n"
+            "  - If quest history gives you evidence, NAME the players and argue for exclusion. "
+            "Politeness about evil evidence is a losing strategy.\n"
+            "  - Challenge inconsistencies directly: name the player, cite the specific vote or quest."
+            + accusation
         )
+
+    merlin_opsec = ""
+    if role == "Merlin":
+        merlin_opsec = (
+            "\n⚠ MERLIN — YOUR STATEMENT IS READ BY THE ASSASSIN:\n"
+            "  Never express certainty about evil players beyond what quest math shows everyone.\n"
+            "  Never say 'I know X is evil' — say 'X was on two failed quests.'\n"
+            "  Never reference hidden information even indirectly. Phrase everything as behavioral observation.\n"
+        )
+
     if prior_statements:
         turn_instruction = (
             f"It is {my_name}'s turn to speak in the Q{state.quest_num} discussion.\n"
-            f"React to what others have said. Address players by name. {goal}\n"
+            f"React to what others have said. Address players by name.\n{goal}\n{merlin_opsec}"
         )
     else:
         turn_instruction = (
             f"It is {my_name}'s turn to speak first in the Q{state.quest_num} discussion.\n"
-            f"No one has spoken yet. Set the frame for this quest. {goal}\n"
+            f"No one has spoken yet. Set the frame.\n{goal}\n{merlin_opsec}"
         )
     return (
         f"{priority}\n\n{context}"
@@ -701,10 +838,51 @@ def get_vote_prompt(state, slot_id: int, proposer_slot: int, proposed_team: List
         else:
             team_annotation = f"\nNO EVIL ON THIS TEAM — if approved, this mission will succeed regardless of your vote here."
 
+    # Add this block in get_vote_prompt before the return statement:
+
+    faction = ROLES_CONFIG[role]["faction"]
+    evil_slots = {state.role_to_slot["Assassin"], state.role_to_slot["Morgana"]}
+    evil_on_team = any(s in evil_slots for s in proposed_team)
+
+    score_mandate = ""
+    if faction == "good":
+        if state.evil_wins == 2 and state.good_wins == 2:
+            score_mandate = (
+                "\n🚨 DECISIVE QUEST — one quest ends the game.\n"
+                "  REJECT any team you are not certain is fully clean. 'Let's see what happens' = handing evil the win."
+            )
+        elif state.evil_wins == 2:
+            score_mandate = (
+                "\n🚨 EVIL IS ONE FAIL FROM WINNING. A failed quest ends the game immediately.\n"
+                "  REJECT unless every player on this team is confirmed good. 'Gathering data' is not a valid reason here."
+            )
+        elif state.good_wins == 2:
+            score_mandate = (
+                "\n⚡ Good is one success from the Assassin phase. Approve only if you are confident the team is clean."
+            )
+    else:  # evil
+        if state.good_wins == 2 and state.evil_wins == 2:
+            score_mandate = (
+                f"\n🚨 DECISIVE QUEST.\n"
+                f"  Evil on this team: {'YES — APPROVE. Play FAIL on the mission.' if evil_on_team else 'NO — this team will succeed regardless of your vote here.'}\n"
+                + ("" if evil_on_team else
+                   "  REJECT this team. Find a credible public reason. A clean success triggers the Assassin phase.")
+            )
+        elif state.good_wins == 2:
+            score_mandate = (
+                f"\n🚨 Good is ONE success from triggering the Assassin phase.\n"
+                f"  Evil on this team: {'YES — APPROVE and play FAIL on the mission.' if evil_on_team else 'NO — REJECT. A clean success hands good the quest phase.'}"
+            )
+        elif state.evil_wins == 2:
+            score_mandate = (
+                f"\n⚡ Evil is ONE fail from winning outright.\n"
+                f"  Evil on this team: {'YES — APPROVE, then play FAIL to end the game immediately.' if evil_on_team else 'NO — mission will succeed regardless. REJECT if you can find a credible reason.'}"
+            )
+
     return (
         f"{priority}\n\n{context}"
         f"{proposer_name} proposes for Q{state.quest_num}: {team_names}{self_note}{own_note}{team_annotation}\n\n"
-        f"{urgency}\n"
+        f"{urgency}{score_mandate}\n"
         f"{my_name}, vote APPROVE or REJECT. Your vote AND your stated reason are both PUBLIC.\n"
         f"Everyone will hear what you say. Draw on the full history and your notes when reasoning.\n\n"
         f'{{"vote": "APPROVE or REJECT", '
@@ -751,14 +929,16 @@ def get_mission_prompt(state, slot_id: int, role: str, team: List[int]) -> str:
         evil_on_team = [s for s in team if s in evil_slots]
         if len(evil_on_team) == len(team):
             coordination_warning = (
-                f"\nBOTH evil players are on this {len(team)}-person team. "
-                f"One FAIL is sufficient — if both play FAIL, the fail count equals the team size, "
-                f"mathematically confirming every team member as evil to all observers.\n"
+                f"\n🚨 RULE — BOTH evil players are on this {len(team)}-person team.\n"
+                f"  Exactly ONE of you plays FAIL. The other plays SUCCESS. This is not optional.\n"
+                f"  If both play FAIL: fail_count = team_size → EVERY member is mathematically confirmed evil.\n"
+                f"  That is complete, unrecoverable exposure of the entire evil team.\n"
+                f"  One FAIL fails the quest. Two FAILs destroys your cover.\n"
             )
         elif len(evil_on_team) > 1:
             coordination_warning = (
-                f"\nMultiple evil players are on this team. One FAIL is sufficient — "
-                f"multiple fails narrow suspicion proportionally to team size.\n"
+                f"\nMultiple evil players on this team. ONE FAIL is sufficient — do not stack fails unnecessarily.\n"
+                f"Additional fails narrow the suspect pool proportionally. Play conservatively.\n"
             )
 
     return (
