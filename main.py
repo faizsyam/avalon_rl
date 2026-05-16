@@ -32,7 +32,8 @@ from storage.printer import (
     BOLD, YELLOW, RESET, DIM,
 )
 from game.roles import ALL_ROLES
-from memory.manager import should_consolidate_now
+from memory.manager import should_consolidate_now, get_lesson_path, EVIL_COORD_FILE, GOOD_COORD_FILE
+import glob
 
 def run():
     for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR]:
@@ -49,6 +50,15 @@ def run():
     print(f"{BOLD}{YELLOW}  AVALON RL EXPERIMENT{RESET}")
     print(f"{DIM}  Resuming from game {start_game}{RESET}")
     print(f"{BOLD}{'═'*60}{RESET}")
+
+    if start_game <= 1:
+        for role in ALL_ROLES:
+            p = get_lesson_path(role)
+            if os.path.exists(p):
+                os.remove(p)
+        for f in [EVIL_COORD_FILE, GOOD_COORD_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
 
     for game_id in range(start_game, MAX_GAMES + 1):
         state = engine.run_game(game_id)

@@ -1,12 +1,13 @@
 import os
 import re
 from game.state import GameState
-from game.roles import ROLES_CONFIG, ALL_ROLES
-from agents.llm_client import call_llm_json
+from game.roles import ROLES_CONFIG, ALL_ROLES, DIMENSION_DESCRIPTIONS
+from agents.llm_client import call_llm_json, call_llm_json_prefill
 from memory.manager import (
     apply_lesson_delta,
     apply_evil_coord_delta,
     apply_good_coord_delta,
+    get_lesson_stats
 )
 
 MIN_LESSONS_PER_REFLECTION = 3
@@ -172,10 +173,12 @@ def _build_epistemic_constraints(role: str, state: GameState, slot_id: int) -> s
     elif role == "Percival":
         merlin_name = _n(state, merlin_slot)
         morgana_name = _n(state, morgana_slot)
-        lines.append(f"WHAT YOU KNEW: Two players appeared as Merlin to you: the real Merlin and Morgana.")
-        lines.append(f"POST-GAME REVEAL (do not use as if known during play): Real Merlin={merlin_name}, Morgana={morgana_name}.")
-        lines.append("LESSON RULE: Lessons about 'which player was Merlin' must be framed as inference, not fact.")
-        lines.append("LESSON RULE: 'I now know X was Morgana' is hindsight. Reframe as 'behavioral signal Y suggests Morgana'.")
+        lines.append(f"WHAT YOU KNEW: Two players appeared as Merlin to you — one was real Merlin, one was Morgana.")
+        lines.append(f"POST-GAME REVEAL: Real Merlin={merlin_name}, Morgana={morgana_name}.")
+        lines.append("YOUR ROLE GOAL: Identify which of your two Merlin candidates is real, and protect them.")
+        lines.append("LESSON RULE: Do NOT write lessons about concealing your own identity — you are not Merlin.")
+        lines.append("LESSON RULE: Lessons must be about identifying real Merlin vs Morgana, protecting Merlin,")
+        lines.append("            and using behavioral evidence to confirm or deny the two candidates.")
 
     elif role == "LoyalServant":
         lines.append("WHAT YOU KNEW: Nothing about roles. Only observable evidence: votes, proposals, quest outcomes.")
@@ -315,9 +318,9 @@ ADVERSARIAL LEARNING — What good players track in your behavior:
         f"You are {my_name}, who played {role} ({'GOOD' if faction == 'good' else 'EVIL'} team) "
         f"in The Resistance: Avalon. Your faction {'WON' if faction_won else 'LOST'} (outcome: {outcome_tag}).\n\n"
         f"Extract SPECIFIC, ACTIONABLE lessons covering MULTIPLE dimensions. Rules:\n"
-        f"- Generate EXACTLY 3 lessons minimum, one per dimension. Required dimensions for this response: "
-        f"{', '.join(dims[:3])}. Additional dimensions welcome.\n"
-        f"- Distribute lessons across different dimensions — do NOT put multiple lessons in 'mistakes_to_avoid'.\n"
+        f"- Generate exactly 1 lesson per dimension. There are 3 dimensions — return exactly 3 lessons.\n"
+        f"- Dimension definitions:\n" + "".join(f"    {d}: {DIMENSION_DESCRIPTIONS[d]}\n" for d in dims)
+        + f"- Keep each lesson under 40 words. Precision over length.\n"
         f"- Write each lesson as a concrete reusable rule: 'When X, do Y because Z.'\n"
         f"- NO narrative. NO 'In Q2 I did X'. Write reusable rules, not game recaps.\n"
         f"- NO player names ({', '.join(all_names)}). Reference roles or behavioral patterns.\n"
@@ -366,9 +369,9 @@ Return ONLY valid JSON:
 {{
   "reasoning": "for each key decision: was it correct and what was the consequence",
   "add_tentative": [
-    {{"dimension": "<choose from: {dims_str}>", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "<choose from: {dims_str}>", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "<choose from: {dims_str}>", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
+    {{"dimension": "win_loss_cause", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
+    {{"dimension": "action_decisions", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
+    {{"dimension": "behavioral_strategy", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
   ],
   "confirm_active": [
     {{"dimension": "dimension_name", "lesson": "restated merged lesson", "keyword": "unique word from existing tentative lesson"}}
@@ -418,10 +421,10 @@ def _build_evil_coord_prompt(state: GameState) -> tuple:
         )
 
     system = (
-        "Extract specific coordination lessons for Assassin and Morgana to use in future games. "
-        f"NO player names ({', '.join(all_names)}). Reference roles or behavioral patterns only. "
-        "Write rule-form lessons ('When X, do Y because Z'), not game recaps. "
-        f"Minimum 2 lessons. Tag each with outcome: (observed on {outcome_tag})."
+        "Extract 1 coordination lesson for Assassin and Morgana under dimension 'coordination_dynamics': "
+        f"{DIMENSION_DESCRIPTIONS['coordination_dynamics']} "
+        f"NO player names ({', '.join(all_names)}). Max 40 words. "
+        f"Rule form: 'When X, do Y because Z. (observed on {outcome_tag})'"
     )
     user = f"""
 Outcome: {state.outcome} ({outcome_tag})
@@ -432,21 +435,16 @@ MISSIONS:\n{mission_summary}
 {discussion_summary}
 {assassin_reveal}
 
-Analyze:
-1. Did their vote patterns expose the alliance? Look for synchronized APPROVE/REJECT.
-2. Was sabotage timing optimal? If no fails occurred, was that the right call?
-3. Were their discussion statements complementary or redundant? Did either player reveal the alliance?
-4. Did Morgana successfully mimic Merlin's reasoning style, or were there detectable differences?
-5. How could the Assassin have better identified Merlin from behavioral signals?
-
-Dimensions: covering_for_each_other, vote_synchronization, mission_sabotage_timing, blame_deflection
+Analyze evil-team coordination:
+1. Evaluate how effectively the evil team coordinated to blend in, influence decisions, and avoid 
+creating suspicious voting or proposal patterns.
+2. Evaluate how well the evil team maintained believable separation while still supporting shared 
+strategic objectives.
 
 Return ONLY valid JSON with EXACTLY these 3 items in add_tentative, one per required dimension:
 {{
   "add_tentative": [
-    {{"dimension": "vote_synchronization", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "mission_sabotage_timing", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "blame_deflection", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
+    {{"dimension": "coordination_dynamics", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
   ],
   "confirm_active": [],
   "flag_deprecated": []
@@ -499,10 +497,10 @@ def _build_good_coord_prompt(state: GameState) -> tuple:
         )
 
     system = (
-        "Extract good-team coordination lessons for Merlin, Percival, and LoyalServant. "
-        f"NO player names ({', '.join(all_names)}). Reference roles and behavioral patterns only. "
-        "Write rule-form lessons ('When X, do Y because Z'), not game recaps. "
-        f"Minimum 2 lessons. Tag each with outcome: (observed on {outcome_tag})."
+        "Extract 1 coordination lesson for Merlin, Percival, and LoyalServant under dimension 'coordination_dynamics': "
+        f"{DIMENSION_DESCRIPTIONS['coordination_dynamics']} "
+        f"NO player names ({', '.join(all_names)}). Max 40 words. "
+        f"Rule form: 'When X, do Y because Z. (observed on {outcome_tag})'"
     )
     user = f"""
 Outcome: {state.outcome} ({outcome_tag})
@@ -514,22 +512,15 @@ MISSIONS:\n{mission_summary}
 {assassin_reveal}
 
 Analyze good-team coordination:
-1. Did Merlin successfully signal evil reads to Percival without revealing their role?
-2. Did Percival protect Merlin's identity while still acting on Merlin's signals?
-3. Did LoyalServant correctly identify and align with good players through observable evidence?
-4. Were good team vote patterns coordinated enough to block evil proposals?
-5. Did Merlin's behavior reveal their identity to the Assassin? What specifically?
-6. How could good team have coordinated more safely without exposing Merlin?
-
-Dimensions: merlin_signal_protection, evil_identification_coordination,
-            team_composition_alignment, vote_coordination, merlin_concealment_support
+1. Evaluate how effectively the good team coordinated to identify and isolate suspicious players 
+while maintaining subtle and aligned signaling.
+2. Evaluate how consistently the good team maintained trust, voting alignment, and safe proposal 
+coordination throughout the game.
 
 Return ONLY valid JSON with EXACTLY these 3 items in add_tentative, one per required dimension:
 {{
   "add_tentative": [
-    {{"dimension": "evil_identification_coordination", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "team_composition_alignment", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}},
-    {{"dimension": "merlin_concealment_support", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
+    {{"dimension": "coordination_dynamics", "lesson": "FILL IN: When X, do Y because Z. (observed on {outcome_tag})"}}
   ],
   "confirm_active": [],
   "flag_deprecated": []
@@ -610,32 +601,63 @@ def _has_sufficient_lessons(delta: dict) -> bool:
 
 def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id: int) -> dict:
     config = ROLES_CONFIG[role]
-    dims = config["dimensions"]
+    dims = config["dimensions"]  # always ["win_loss_cause", "action_decisions", "behavioral_strategy"]
     dims_str = ", ".join(f'"{d}"' for d in dims)
-    last_delta = {}
+
+    # Force correct array structure via prefill
+    PREFILL = '{"add_tentative": ['
 
     for attempt in range(MAX_REFLECTION_RETRIES + 1):
         effective_user = user if attempt == 0 else (
             user
-            + f"\n\n⚠️ RETRY ATTEMPT {attempt}: Your previous response did not meet requirements.\n"
-            f"You MUST return at least {MIN_LESSONS_PER_REFLECTION} lessons spread across at least "
-            f"2 of these dimensions: {dims_str}.\n"
-            f"Do NOT put all lessons in 'mistakes_to_avoid'. Each dimension listed in the template "
-            f"requires its own distinct, actionable lesson.\n"
-            f"Return ONLY valid JSON matching the schema above — no prose outside the JSON object."
+            + f"\n\n⚠️ RETRY {attempt}: Return exactly 3 lessons, one per dimension: {dims_str}. "
+            f"The JSON must start with: {{\"add_tentative\": [{{\"dimension\": \"win_loss_cause\""
         )
-        delta = call_llm_json(
+        delta = call_llm_json_prefill(
             llm, system, effective_user,
+            prefill=PREFILL,
             call_label=f"reflection {role} (attempt {attempt + 1})"
         )
         if not isinstance(delta, dict):
             continue
         delta = _rescue_toplevel_lesson(delta)
-        last_delta = delta
+
+        # If still short, make per-dimension targeted calls for missing dims
+        existing = {
+            item.get("dimension") for item in delta.get("add_tentative", [])
+            if isinstance(item, dict) and item.get("lesson", "").strip()
+        }
+        missing = [d for d in dims if d not in existing]
+
+        if missing:
+            for dim in missing:
+                dim_desc = DIMENSION_DESCRIPTIONS.get(dim, dim)
+                dim_prefill = f'{{"dimension": "{dim}", "lesson": "'
+                targeted_system = (
+                    f"You are writing a single lesson for the '{dim}' dimension. "
+                    f"Definition: {dim_desc} "
+                    f"Role: {role}. Max 40 words. Format: When X, do Y because Z."
+                )
+                targeted_user = (
+                    f"{user}\n\nWrite ONLY the lesson for dimension '{dim}'. "
+                    f"Return ONLY: {{\"dimension\": \"{dim}\", \"lesson\": \"When X, do Y because Z. (observed on WIN or LOSS)\"}}"
+                )
+                dim_delta = call_llm_json(llm, targeted_system, targeted_user,
+                                          call_label=f"reflection {role} dim={dim}")
+                if isinstance(dim_delta, dict):
+                    lesson = dim_delta.get("lesson", "").strip()
+                    if not lesson:
+                        # try top-level rescue
+                        lesson = dim_delta.get(dim, "").strip()
+                    if lesson and "<" not in lesson:
+                        delta.setdefault("add_tentative", []).append(
+                            {"dimension": dim, "lesson": lesson}
+                        )
+
         if _has_sufficient_lessons(delta):
             return delta
 
-    return last_delta
+    return delta if isinstance(delta, dict) else {}
 
 def _log_coord_reflection_debug(label: str, game_id: int, delta: dict):
     import json as _json
@@ -682,6 +704,12 @@ def run_reflection(state: GameState, llm) -> dict:
         else:
             counts[role] = {"tentative": 0, "confirmed": 0, "deprecated": 0}
             _log_reflection_debug(state.game_id, role, {}, {})
+
+        stats = get_lesson_stats()
+        role_stats = stats.get(role, {})
+        total_stored = role_stats.get("active", 0) + role_stats.get("tentative", 0)
+        if applied.get("tentative", 0) > 0 and total_stored == 0:
+            print(f"    [WARN] {role}: delta had lessons but file shows 0 stored — check _apply_delta")
 
     system, user, names = _build_evil_coord_prompt(state)
     coord_delta = call_llm_json(llm, system, user, call_label="evil coord reflection")

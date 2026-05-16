@@ -2,16 +2,7 @@ import os
 from typing import Dict, List, Optional
 
 from config import LESSONS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
-from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, GOOD_COORD_DIMENSIONS, ALL_ROLES
-
-
-GOOD_COORD_DIMENSIONS = [
-    "merlin_signal_protection",       # How Merlin signals evil reads without exposing role
-    "evil_identification_coordination", # How good players converge on evil reads via evidence
-    "team_composition_alignment",     # Shared principles for building safe mission teams
-    "vote_coordination",              # Coordinating reject/approve without revealing roles
-    "merlin_concealment_support",     # How Percival/LoyalServant help shield Merlin's identity
-]
+from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, GOOD_COORD_DIMENSIONS, ALL_ROLES, DIMENSION_DESCRIPTIONS
 
 # Per-dimension caps: kept here so consolidation and apply_delta enforce the same values.
 TENTATIVE_CAP = 5   # max tentative lessons per dimension before forced consolidation
@@ -51,12 +42,6 @@ def _init_good_coord() -> str:
     }, GOOD_COORD_DIMENSIONS)
     _write(GOOD_COORD_FILE, content)
     return content
-
-def _write(path: str, content: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
 
 def _parse(content: str, dimensions: List[str]) -> Dict:
     parsed = {
@@ -220,14 +205,39 @@ def _resolve_dim(parsed_dims: dict, raw_dim: str) -> Optional[str]:
     return None
 
 
-def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 12) -> bool:
-    new_words = set(new_lesson.lower().split())
+_STOPWORDS = {
+    'when','you','are','the','a','an','to','of','in','is','it','as','at','by',
+    'or','and','not','be','do','if','on','so','that','this','for','from','but',
+    'with','your','their','they','them','have','has','had','was','were','will',
+    'would','should','could','can','may','might','which','what','who','how',
+    'because','since','about','into','than','then','also','other','after',
+    'before','during','without','within','against','between','through','each',
+    'some','any','all','both','its','my','our','we','us','me','him','her','i',
+    'do','did','does','been','being','same','different','specific','general',
+    'make','makes','made','use','used','using','avoid','choose','ensure','try',
+}
+
+def _content_words(text: str) -> set:
+    import re
+    words = set(re.sub(r'[^a-z0-9_-]', ' ', text.lower()).split())
+    return words - _STOPWORDS
+
+def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 6) -> bool:
+    new_words = _content_words(new_lesson)
     for existing in existing_lessons:
-        existing_words = set(existing.lower().split())
-        overlap = len(new_words & existing_words)
-        if overlap >= threshold:
+        existing_words = _content_words(existing)
+        if len(new_words & existing_words) >= threshold:
             return True
     return False
+
+def _write(path: str, content: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    # Verify write succeeded and content is non-empty
+    written = open(path, "r", encoding="utf-8").read()
+    if len(written) < 50:
+        raise RuntimeError(f"_write to {path} produced suspiciously short file ({len(written)} chars)")
 
 
 def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str]) -> Dict:
@@ -343,9 +353,11 @@ def consolidate_lessons(role: str, llm, game_id: int):
     current = open(path, "r", encoding="utf-8").read()
     dims = ROLES_CONFIG[role]["dimensions"]
 
+    dim_desc = "\n".join(f"  {d}: {DIMENSION_DESCRIPTIONS[d]}" for d in dims)
     system = (
-        f"You are consolidating a strategic memory file for the {role} role in Avalon. "
-        "Be strict. Preserve outcome tags (WIN/LOSS) in lessons — they are analytically valuable."
+        f"You are consolidating a strategic memory file for the {role} role in Avalon.\n"
+        f"Dimension definitions:\n{dim_desc}\n"
+        "Ensure each lesson is under 40 words and placed in the correct dimension. Be strict."
     )
     user = (
         f"Current lessons file for {role}:\n\n{current}\n\n"
@@ -371,10 +383,24 @@ def consolidate_lessons(role: str, llm, game_id: int):
     )
     result = call_llm_json(llm, system, user)
     updated = result.get("updated_file", "")
-    if updated and len(updated) > 100:
-        parsed = _parse(updated, dims)
-        parsed = _bump_version(parsed, game_id)
-        _write(path, _serialize(parsed, dims))
+    if not updated or len(updated) < 100:
+        return  # LLM failed — preserve existing file untouched
+
+    updated_parsed = _parse(updated, dims)
+    original_parsed = _parse(current, dims)
+
+    # Merge: never drop active lessons that existed before consolidation
+    for dim in dims:
+        orig_active = set(original_parsed["dimensions"][dim]["active"])
+        new_active = set(updated_parsed["dimensions"][dim]["active"])
+        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
+        # Restore any active lesson that was silently dropped (not explicitly deprecated)
+        for lesson in orig_active:
+            if lesson not in new_active and lesson not in new_deprecated:
+                updated_parsed["dimensions"][dim]["active"].append(lesson)
+
+    updated_parsed = _bump_version(updated_parsed, game_id)
+    _write(path, _serialize(updated_parsed, dims))
 
 
 def consolidate_evil_coord(llm, game_id: int):
@@ -400,10 +426,19 @@ def consolidate_evil_coord(llm, game_id: int):
     )
     result = call_llm_json(llm, system, user)
     updated = result.get("updated_file", "")
-    if updated and len(updated) > 100:
-        parsed = _parse(updated, EVIL_COORD_DIMENSIONS)
-        parsed = _bump_version(parsed, game_id)
-        _write(EVIL_COORD_FILE, _serialize(parsed, EVIL_COORD_DIMENSIONS))
+    if not updated or len(updated) < 100:
+        return
+    updated_parsed = _parse(updated, EVIL_COORD_DIMENSIONS)
+    original_parsed = _parse(current, EVIL_COORD_DIMENSIONS)
+    for dim in EVIL_COORD_DIMENSIONS:
+        orig_active = set(original_parsed["dimensions"][dim]["active"])
+        new_active = set(updated_parsed["dimensions"][dim]["active"])
+        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
+        for lesson in orig_active:
+            if lesson not in new_active and lesson not in new_deprecated:
+                updated_parsed["dimensions"][dim]["active"].append(lesson)
+    updated_parsed = _bump_version(updated_parsed, game_id)
+    _write(EVIL_COORD_FILE, _serialize(updated_parsed, EVIL_COORD_DIMENSIONS))
 
 
 def consolidate_good_coord(llm, game_id: int):
@@ -429,10 +464,19 @@ def consolidate_good_coord(llm, game_id: int):
     )
     result = call_llm_json(llm, system, user)
     updated = result.get("updated_file", "")
-    if updated and len(updated) > 100:
-        parsed = _parse(updated, GOOD_COORD_DIMENSIONS)
-        parsed = _bump_version(parsed, game_id)
-        _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_DIMENSIONS))
+    if not updated or len(updated) < 100:
+        return
+    updated_parsed = _parse(updated, GOOD_COORD_DIMENSIONS)
+    original_parsed = _parse(current, GOOD_COORD_DIMENSIONS)
+    for dim in GOOD_COORD_DIMENSIONS:
+        orig_active = set(original_parsed["dimensions"][dim]["active"])
+        new_active = set(updated_parsed["dimensions"][dim]["active"])
+        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
+        for lesson in orig_active:
+            if lesson not in new_active and lesson not in new_deprecated:
+                updated_parsed["dimensions"][dim]["active"].append(lesson)
+    updated_parsed = _bump_version(updated_parsed, game_id)
+    _write(GOOD_COORD_FILE, _serialize(updated_parsed, GOOD_COORD_DIMENSIONS))
 
 def should_consolidate_now(tentative_threshold: int = CONSOLIDATION_THRESHOLD) -> bool:
     """

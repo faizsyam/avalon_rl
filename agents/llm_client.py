@@ -32,10 +32,12 @@ def _call(llm: dict, messages: list) -> str:
     try:
         response = llm["client"].chat.completions.create(
             model=llm["model"],
-            messages=messages,
+            # messages=messages,
+            messages=[{"role":"user","content":f"{messages}"}],
             temperature=llm["temperature"],
             max_tokens=llm["max_tokens"],
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": True, "clear_thinking": True}},
+            stream=False
         )
         return response.choices[0].message.content or ""
     except Exception as e:
@@ -167,3 +169,35 @@ def call_llm_json(llm: dict, system: str, user: str, call_label: str = "") -> di
             f.write(f"{retry_warn}\nretry_response: {retry_text}\n")
 
     return retry_result
+
+def call_llm_json_prefill(llm: dict, system: str, user: str, prefill: str, call_label: str = "") -> dict:
+    """Like call_llm_json but with a custom assistant prefill to force output structure."""
+    augmented_system = system + _JSON_SYSTEM_ADDON
+    augmented_user = user + _JSON_SUFFIX
+
+    messages = [
+        {"role": "system", "content": augmented_system},
+        {"role": "user", "content": augmented_user},
+        {"role": "assistant", "content": prefill},
+    ]
+
+    text = _call(llm, messages)
+    # Strip the prefill from the response if model echoes it back
+    if text.startswith(prefill[1:]):  # prefill starts with '{', text starts after
+        text = text[len(prefill) - 1:]
+    result = parse_json(prefill + text) if text else {}
+    if result:
+        return result
+
+    label_str = f" for {call_label}" if call_label else ""
+    warn_message = f"[WARN] Invalid JSON{label_str} — retrying"
+    print(f"    {warn_message}")
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_path = os.path.join(LOGS_DIR, "warns.txt")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*80}\n")
+        f.write(f"Timestamp  : {datetime.utcnow().isoformat()} UTC\n")
+        f.write(f"Warning    : {warn_message}\n")
+        f.write(f"call_label : {call_label}\n")
+        f.write(f"response   : {text}\n")
+    return {}
