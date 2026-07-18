@@ -5,7 +5,7 @@ from typing import Optional
 
 from config import METRICS_FILE, STOPPING, CHECKPOINTS_DIR, EVIL_COORD_FILE
 from game.roles import ALL_ROLES
-from memory.manager import get_lesson_path, load_lessons
+from memory.manager import get_lesson_path, snapshot_all_lessons
 
 
 def load_metrics() -> dict:
@@ -51,7 +51,7 @@ def record_game(state, metrics: dict) -> dict:
 
 def snapshot_lessons(metrics: dict, game_id: int):
     for role in ALL_ROLES:
-        content = load_lessons(role)
+        content = snapshot_all_lessons(role)
         snapshots = metrics["lesson_snapshots"].setdefault(role, [])
         snapshots.append(content)
         metrics["lesson_snapshots"][role] = snapshots[-20:]

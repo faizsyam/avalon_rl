@@ -1,13 +1,119 @@
 import os
+import re
 from typing import Dict, List, Optional
 
 from config import LESSONS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
-from game.roles import ROLES_CONFIG, EVIL_COORD_DIMENSIONS, GOOD_COORD_DIMENSIONS, ALL_ROLES, DIMENSION_DESCRIPTIONS
+from game.roles import ROLES_CONFIG, EVIL_COORD_PHASES, GOOD_COORD_PHASES, ALL_ROLES, PHASE_DESCRIPTIONS
 
-# Per-dimension caps: kept here so consolidation and apply_delta enforce the same values.
-TENTATIVE_CAP = 5   # max tentative lessons per dimension before forced consolidation
-ACTIVE_CAP = 5      # max active lessons per dimension (enforced during consolidation)
-CONSOLIDATION_THRESHOLD = 3  # tentative count that triggers consolidation check
+# Per-phase caps: shared by lesson files and coordination files alike.
+TENTATIVE_CAP = 5
+ACTIVE_CAP = 5
+CONSOLIDATION_THRESHOLD = 3
+
+# Lesson aging / decay
+LESSON_MAX_AGE = 50
+LESSON_DECAY_RATE = 0.95
+LESSON_DECAY_THRESHOLD = 0.2
+WIN_LOSS_WEIGHT_BOOST = 1.2
+
+# All phase names that may appear in lesson files (validation / debugging).
+PHASES_ALL = ("discussion", "proposal", "vote", "mission", "assassin")
+
+# Phase-specific required action words (word stems, matched with word boundaries)
+PHASE_ACTION_STEMS = {
+    "discussion": ["say", "frame", "ask", "accuse", "deflect", "signal", "name", "propose", "steer"],
+    "proposal": ["propose", "pick", "choose", "select", "include", "exclude", "team", "test"],
+    "vote": ["approve", "reject", "vote"],
+    "mission": ["fail", "success", "play"],
+    "assassin": ["guess", "target", "identify", "name"]
+}
+
+VAGUE_PHRASES = (
+    "be careful", "watch everyone", "be cautious", "read the room",
+    "trust steady players", "pay attention", "stay alert", "be aware",
+    "be smart", "play well", "make good choices",
+)
+
+
+def validate_lesson(lesson: str, phase: str) -> tuple[bool, str]:
+    """Canonical lesson validator. Returns (is_valid, reason_if_invalid).
+    Used by both the reflector (to reject malformed LLM emissions) and by
+    consolidate_lessons (to filter anything that slipped past the LLM)."""
+    if not lesson or not lesson.strip():
+        return False, "empty lesson"
+
+    stripped = lesson.strip()
+    # Strip leading "- [gXXX] "-style marker so the body can be matched.
+    body = re.sub(r'^-\s*\[(?:DEPRECATED\s+)?g\d+\]\s*', '', stripped)
+    body = re.sub(r'^-\s*', '', body).strip()
+
+    words = body.split()
+    if len(words) > 35:
+        return False, f"exceeds 35 words ({len(words)})"
+    if not body.startswith("When "):
+        return False, "must start with 'When '"
+    if " do " not in body and " Do " not in body:
+        # Action phrase; recasts of action verbs (REJECT/FAIL/etc.) at
+        # the top of the rule are handled by the phase stem check below.
+        pass  # Phase-action-stem check below catches the same cases.
+    if " because " not in body:
+        return False, "must contain ' because ' (causal reason)"
+
+    has_win = "(observed on WIN)" in body
+    has_loss = "(observed on LOSS)" in body
+    if not (has_win or has_loss):
+        return False, "must end with '(observed on WIN)' or '(observed on LOSS)'"
+    if has_win and has_loss:
+        return False, "cannot have both WIN and LOSS tags"
+
+    # Phase-specific required action content.
+    if phase == "vote":
+        if "APPROVE" not in body and "REJECT" not in body:
+            return False, "vote lesson must specify APPROVE or REJECT"
+    elif phase == "mission":
+        if "FAIL" not in body and "SUCCESS" not in body:
+            return False, "mission lesson must specify FAIL or SUCCESS"
+    elif phase == "assassin":
+        if "guess" not in body.lower() and "target" not in body.lower():
+            return False, "assassin lesson must mention guess or target"
+
+    # Phase-specific required action stem (word-boundary, case-insensitive).
+    action_stems = PHASE_ACTION_STEMS.get(phase, [])
+    if action_stems:
+        if not any(re.search(rf'\b{re.escape(stem)}\w*\b', body, re.IGNORECASE) for stem in action_stems):
+            return False, f"phase '{phase}' lesson must contain a phase-appropriate action verb"
+
+    lower_body = body.lower()
+    for vague in VAGUE_PHRASES:
+        if vague in lower_body:
+            return False, f"contains vague filler: '{vague}'"
+
+    return True, ""
+
+
+def _validate_lesson_format(lesson: str, phase: str) -> bool:
+    """Backwards-compatible boolean wrapper. New code should call validate_lesson."""
+    return validate_lesson(lesson, phase)[0]
+
+
+def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
+    """Remove any invalid lessons from active/tentative zones after LLM consolidation."""
+    for phase in phases:
+        for zone in ("active", "tentative"):
+            lst = parsed["dimensions"][phase][zone]
+            valid = []
+            for lesson in lst:
+                if _validate_lesson_format(lesson, phase):
+                    valid.append(lesson)
+                else:
+                    # Move invalid to deprecated
+                    deprecated_entry = (
+                        f"- [DEPRECATED g{game_id:03d}] {lesson.lstrip('- ')}"
+                        f" — auto-deprecated: invalid format"
+                    )
+                    parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
+            parsed["dimensions"][phase][zone] = valid
+    return parsed
 
 
 def ensure_dirs():
@@ -17,12 +123,13 @@ def ensure_dirs():
 def get_lesson_path(role: str) -> str:
     return os.path.join(LESSONS_DIR, f"{role.lower()}.txt")
 
+
 def _init_lesson_file(role: str) -> str:
-    dims = ROLES_CONFIG[role]["dimensions"]
+    phases = ROLES_CONFIG[role]["phases"]
     content = _serialize({
         "header": [f"=== {role.upper()} LESSONS ===", "version: 0", "last_updated: none"],
-        "dimensions": {d: {"active": [], "tentative": [], "deprecated": []} for d in dims}
-    }, dims)
+        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in phases}
+    }, phases)
     _write(get_lesson_path(role), content)
     return content
 
@@ -30,30 +137,34 @@ def _init_lesson_file(role: str) -> str:
 def _init_evil_coord() -> str:
     content = _serialize({
         "header": ["=== EVIL COORDINATION MEMORY ===", "version: 0", "last_updated: none"],
-        "dimensions": {d: {"active": [], "tentative": [], "deprecated": []} for d in EVIL_COORD_DIMENSIONS}
-    }, EVIL_COORD_DIMENSIONS)
+        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in EVIL_COORD_PHASES}
+    }, EVIL_COORD_PHASES)
     _write(EVIL_COORD_FILE, content)
     return content
+
 
 def _init_good_coord() -> str:
     content = _serialize({
         "header": ["=== GOOD COORDINATION MEMORY ===", "version: 0", "last_updated: none"],
-        "dimensions": {d: {"active": [], "tentative": [], "deprecated": []} for d in GOOD_COORD_DIMENSIONS}
-    }, GOOD_COORD_DIMENSIONS)
+        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in GOOD_COORD_PHASES}
+    }, GOOD_COORD_PHASES)
     _write(GOOD_COORD_FILE, content)
     return content
 
-def _parse(content: str, dimensions: List[str]) -> Dict:
+
+def _parse(content: str, phases: List[str]) -> Dict:
+    """Parse a lesson file keyed by phase. The internal dict key stays 'dimensions'
+    for minimal churn — its keys ARE phase names. ACTIVE/TENTATIVE/DEPRECATED zones."""
     parsed = {
         "header": [],
-        "dimensions": {d: {"active": [], "tentative": [], "deprecated": []} for d in dimensions}
+        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in phases}
     }
     current_dim = None
     current_zone = None
 
     for line in content.split("\n"):
         stripped = line.strip()
-        matched_dim = next((d for d in dimensions if stripped == f"[{d}]"), None)
+        matched_dim = next((p for p in phases if stripped == f"[{p}]"), None)
         if matched_dim:
             current_dim = matched_dim
             current_zone = None
@@ -71,14 +182,14 @@ def _parse(content: str, dimensions: List[str]) -> Dict:
     return parsed
 
 
-def _serialize(parsed: Dict, dimensions: List[str]) -> str:
+def _serialize(parsed: Dict, phases: List[str]) -> str:
     lines = [l for l in parsed["header"] if l is not None]
     lines.append("")
-    for dim in dimensions:
-        d = parsed["dimensions"].get(dim, {"active": [], "tentative": [], "deprecated": []})
-        lines += [f"[{dim}]", "ACTIVE:"] + d["active"] + \
-                 ["TENTATIVE:"] + d["tentative"] + \
-                 ["DEPRECATED:"] + d["deprecated"] + [""]
+    for phase in phases:
+        p = parsed["dimensions"].get(phase, {"active": [], "tentative": [], "deprecated": []})
+        lines += [f"[{phase}]", "ACTIVE:"] + p["active"] + \
+                 ["TENTATIVE:"] + p["tentative"] + \
+                 ["DEPRECATED:"] + p["deprecated"] + [""]
     return "\n".join(lines)
 
 
@@ -98,458 +209,492 @@ def _bump_version(parsed: Dict, game_id: int) -> Dict:
     parsed["header"] = new_header
     return parsed
 
-def load_lessons(role: str) -> str:
+
+def _parse_file(path: str, phases: List[str]) -> Dict:
+    content = open(path, "r", encoding="utf-8").read()
+    return _parse(content, phases)
+
+
+def _phase_block(parsed: Dict, phase: str) -> Dict:
+    """The lesson entries for one phase, keyed by zone."""
+    return parsed["dimensions"].get(phase, {"active": [], "tentative": [], "deprecated": []})
+
+
+def _resolve_phase(dimensions: Dict, raw_phase: str) -> Optional[str]:
+    """Resolve a raw phase string to a valid phase key in the dimensions dict."""
+    raw = raw_phase.strip().lower()
+    if raw in dimensions:
+        return raw
+    # Try common abbreviations/typos
+    aliases = {
+        "discuss": "discussion",
+        "prop": "proposal",
+        "props": "proposal",
+        "voting": "vote",
+        "missions": "mission",
+        "kill": "assassin",
+        "guess": "assassin",
+    }
+    return aliases.get(raw)
+
+
+def _format_phase(entries: Dict, phase: str) -> str:
+    """Compact rendering of one phase's active + tentative lessons for injection."""
+    active = entries.get("active", [])
+    tentative = entries.get("tentative", [])
+    if not active and not tentative:
+        return ""
+    out = [f"[{phase}]"]
+    if active:
+        out.append("CONFIRMED:")
+        out.extend(active)
+    if tentative:
+        if active:
+            out.append("")
+        out.append("PROVISIONAL:")
+        out.extend(tentative)
+    return "\n".join(out)
+
+
+def load_lessons(role: str, phase: str) -> str:
+    """Return ONLY this phase's confirmed+tentative lessons for a role, compactly formatted.
+    Empty string if the role has no lessons for this phase. Phase lessons are injected into
+    the per-phase user prompt (NOT the cached system prompt)."""
     path = get_lesson_path(role)
     if not os.path.exists(path):
-        _init_lesson_file(role)
         return ""
-
-    content = open(path, "r", encoding="utf-8").read()
-    dims = ROLES_CONFIG[role]["dimensions"]
-    parsed = _parse(content, dims)
-
-    active_lines: List[str] = []
-    tentative_lines: List[str] = []
-
-    for dim in dims:
-        d = parsed["dimensions"][dim]
-        if d["active"]:
-            active_lines.append(f"[{dim}]")
-            active_lines.extend(d["active"])
-        if d["tentative"]:
-            tentative_lines.append(f"[{dim}]")
-            tentative_lines.extend(d["tentative"])
-
-    if not active_lines and not tentative_lines:
+    parsed = _parse_file(path, ROLES_CONFIG[role]["phases"])
+    if phase not in parsed["dimensions"]:
         return ""
-
-    output: List[str] = []
-    if active_lines:
-        output.append("CONFIRMED LESSONS (high confidence — apply these):")
-        output.extend(active_lines)
-    if tentative_lines:
-        if output:
-            output.append("")
-        output.append("PROVISIONAL LESSONS (observed once — treat as hypotheses, not rules):")
-        output.extend(tentative_lines)
-
-    return "\n".join(output)
+    return _format_phase(parsed["dimensions"][phase], phase)
 
 
-def load_evil_coord() -> str:
+def load_evil_coord(phase: str) -> str:
     if not os.path.exists(EVIL_COORD_FILE):
-        _init_evil_coord()
         return ""
-
-    content = open(EVIL_COORD_FILE, "r", encoding="utf-8").read()
-    parsed = _parse(content, EVIL_COORD_DIMENSIONS)
-
-    active_lines: List[str] = []
-    tentative_lines: List[str] = []
-
-    for dim in EVIL_COORD_DIMENSIONS:
-        d = parsed["dimensions"][dim]
-        if d["active"]:
-            active_lines.append(f"[{dim}]")
-            active_lines.extend(d["active"])
-        if d["tentative"]:
-            tentative_lines.append(f"[{dim}]")
-            tentative_lines.extend(d["tentative"])
-
-    output: List[str] = []
-    if active_lines:
-        output.append("CONFIRMED:")
-        output.extend(active_lines)
-    if tentative_lines:
-        if output:
-            output.append("")
-        output.append("PROVISIONAL:")
-        output.extend(tentative_lines)
-
-    return "\n".join(output)
+    parsed = _parse_file(EVIL_COORD_FILE, EVIL_COORD_PHASES)
+    if phase not in parsed["dimensions"]:
+        return ""
+    return _format_phase(parsed["dimensions"][phase], phase)
 
 
-def load_good_coord() -> str:
-    from config import GOOD_COORD_FILE
+def load_good_coord(phase: str) -> str:
     if not os.path.exists(GOOD_COORD_FILE):
-        _init_good_coord()
         return ""
-    content = open(GOOD_COORD_FILE, "r", encoding="utf-8").read()
-    parsed = _parse(content, GOOD_COORD_DIMENSIONS)
-    active_lines, tentative_lines = [], []
-    for dim in GOOD_COORD_DIMENSIONS:
-        d = parsed["dimensions"][dim]
-        if d["active"]:
-            active_lines.append(f"[{dim}]")
-            active_lines.extend(d["active"])
-        if d["tentative"]:
-            tentative_lines.append(f"[{dim}]")
-            tentative_lines.extend(d["tentative"])
-    output = []
-    if active_lines:
-        output.append("CONFIRMED:")
-        output.extend(active_lines)
-    if tentative_lines:
-        output.append("")
-        output.append("PROVISIONAL:")
-        output.extend(tentative_lines)
-    return "\n".join(output)
+    parsed = _parse_file(GOOD_COORD_FILE, GOOD_COORD_PHASES)
+    if phase not in parsed["dimensions"]:
+        return ""
+    return _format_phase(parsed["dimensions"][phase], phase)
 
-def _resolve_dim(parsed_dims: dict, raw_dim: str) -> Optional[str]:
-    normalized = raw_dim.strip().lower().replace(" ", "_")
-    if normalized in parsed_dims:
-        return normalized
-    for key in parsed_dims:
-        if key.strip().lower().replace(" ", "_") == normalized:
-            return key
+
+def snapshot_all_lessons(role: str) -> str:
+    """Full file content across all phases — used for the evaluator's lesson-stability
+    metric (compares consecutive whole-files line-by-line). Independent of phase."""
+    path = get_lesson_path(role)
+    if not os.path.exists(path):
+        return ""
+    return open(path, "r", encoding="utf-8").read()
+
+
+def snapshot_all_coord(kind: str) -> str:
+    """Full content of a coordination file. kind: 'evil' or 'good'."""
+    path = EVIL_COORD_FILE if kind == "evil" else GOOD_COORD_FILE
+    if not os.path.exists(path):
+        return ""
+    return open(path, "r", encoding="utf-8").read()
+
+
+def _jaccard_similarity(text1: str, text2: str) -> float:
+    """Compute Jaccard similarity between two texts."""
+    w1 = _content_words(text1)
+    w2 = _content_words(text2)
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / len(w1 | w2)
+
+
+def _normalize_lesson(lesson: str) -> str:
+    """Strip the [gXXX]/[DEPRECATED ...]/ leading-dash metadata so the lesson body
+    can be matched on its own. Used for both near-dup detection and keyword-based
+    promotion/deprecation so we compare apples to apples."""
+    s = lesson.strip()
+    s = re.sub(r'^-\s*\[(?:DEPRECATED\s+)?g\d+\]\s*', '', s)
+    s = re.sub(r'^-\s*', '', s)
+    return s.strip().lower()
+
+
+def _is_near_duplicate(lesson: str, existing: List[str], threshold: float = 0.7) -> bool:
+    """True if `lesson` has ≥`threshold` Jaccard similarity to any existing lesson
+    in the same phase's active+tentative zone. Returns False when existing is empty."""
+    target_words = set(_normalize_lesson(lesson).split()) - _STOPWORDS
+    if not target_words:
+        return False
+    for prior in existing:
+        prior_words = set(_normalize_lesson(prior).split()) - _STOPWORDS
+        if not prior_words:
+            continue
+        union = target_words | prior_words
+        if len(union) == 0:
+            continue
+        overlap = len(target_words & prior_words) / len(union)
+        if overlap >= threshold:
+            return True
+    return False
+
+
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "if", "is", "are", "was", "were",
+    "to", "of", "in", "on", "at", "for", "with", "by", "as", "be", "do",
+    "does", "did", "has", "have", "had", "this", "that", "these", "those",
+    "i", "we", "you", "they", "he", "she", "it",
+})
+
+
+def _match_lesson_phrase(lesson: str, keyword: str) -> bool:
+    """Tight match for confirm_active/flag_deprecated. The keyword must either be a
+    substring of the normalized lesson body, or have all its words appear in order.
+    Generic words like 'evil' or 'fail' cannot accidentally promote unrelated
+    lessons because the substring check requires the literal phrase."""
+    norm = _normalize_lesson(lesson)
+    key = keyword.strip().lower()
+    if not key:
+        return False
+    if key in norm:
+        return True
+    words = key.split()
+    return _words_in_order(norm, words)
+
+
+def _words_in_order(haystack: str, words: List[str]) -> bool:
+    pos = 0
+    for w in words:
+        idx = haystack.find(w, pos)
+        if idx < 0:
+            return False
+        pos = idx + len(w)
+    return True
+
+
+def _parse_game_tag(lesson: str) -> Optional[int]:
+    """Extract game number from lesson tag like [g005]."""
+    import re
+    match = re.search(r'\[g(\d+)\]', lesson)
+    if match:
+        return int(match.group(1))
     return None
 
 
-_STOPWORDS = {
-    'when','you','are','the','a','an','to','of','in','is','it','as','at','by',
-    'or','and','not','be','do','if','on','so','that','this','for','from','but',
-    'with','your','their','they','them','have','has','had','was','were','will',
-    'would','should','could','can','may','might','which','what','who','how',
-    'because','since','about','into','than','then','also','other','after',
-    'before','during','without','within','against','between','through','each',
-    'some','any','all','both','its','my','our','we','us','me','him','her','i',
-    'do','did','does','been','being','same','different','specific','general',
-    'make','makes','made','use','used','using','avoid','choose','ensure','try',
-}
+def _calculate_lesson_weight(lesson: str, current_game: int) -> float:
+    """Calculate decay weight for a lesson based on age and outcome tagging.
+    Returns weight in (0, 1], lower means more likely to deprecate."""
+    game_num = _parse_game_tag(lesson)
+    if game_num is None:
+        return 1.0
 
-def _content_words(text: str) -> set:
-    import re
-    words = set(re.sub(r'[^a-z0-9_-]', ' ', text.lower()).split())
-    return words - _STOPWORDS
+    age = current_game - game_num
+    if age <= LESSON_MAX_AGE:
+        return 1.0
 
-def _is_near_duplicate(new_lesson: str, existing_lessons: List[str], threshold: int = 6) -> bool:
-    new_words = _content_words(new_lesson)
-    for existing in existing_lessons:
-        existing_words = _content_words(existing)
-        if len(new_words & existing_words) >= threshold:
-            return True
-    return False
+    decay = LESSON_DECAY_RATE ** (age - LESSON_MAX_AGE)
+    weight = max(decay, 0.1)
+
+    if "(observed on WIN" in lesson and "(observed on LOSS" in lesson:
+        weight *= WIN_LOSS_WEIGHT_BOOST
+
+    return min(weight, 1.0)
 
 def _write(path: str, content: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    # Verify write succeeded and content is non-empty
     written = open(path, "r", encoding="utf-8").read()
     if len(written) < 50:
         raise RuntimeError(f"_write to {path} produced suspiciously short file ({len(written)} chars)")
 
 
-def _apply_delta(parsed: Dict, delta: dict, game_id: int, dimensions: List[str]) -> Dict:
+def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
     tag = f"[g{game_id:03d}]"
 
     # ---- add_tentative ----
     for item in delta.get("add_tentative", []):
         if not isinstance(item, dict):
             continue
-        raw_dim = item.get("dimension", "")
+        raw_phase = item.get("phase", "") or item.get("dimension", "")
         lesson = item.get("lesson", "").strip()
-        if "<" in raw_dim or "<" in lesson or not raw_dim.strip() or not lesson:
+        if "<" in raw_phase or "<" in lesson or not raw_phase.strip() or not lesson:
             continue
-        dim = _resolve_dim(parsed["dimensions"], raw_dim)
-        if not dim:
+        phase = _resolve_phase(parsed["dimensions"], raw_phase)
+        if not phase:
             continue
 
-        existing_tentative = parsed["dimensions"][dim]["tentative"]
+        existing_tentative = parsed["dimensions"][phase]["tentative"]
         if len(existing_tentative) >= TENTATIVE_CAP:
             continue
 
-        # Skip near-duplicate lessons to prevent restatement bloat.
-        all_existing = existing_tentative + parsed["dimensions"][dim]["active"]
+        all_existing = existing_tentative + parsed["dimensions"][phase]["active"]
         if _is_near_duplicate(lesson, all_existing):
             continue
 
-        parsed["dimensions"][dim]["tentative"].append(f"- {tag} {lesson}")
+        parsed["dimensions"][phase]["tentative"].append(f"- {tag} {lesson}")
 
     for item in delta.get("confirm_active", []):
         if not isinstance(item, dict):
             continue
-        raw_dim = item.get("dimension", "")
-        lesson = item.get("lesson", "").strip()
+        raw_phase = item.get("phase", "") or item.get("dimension", "")
         keyword = item.get("keyword", "").lower().strip()
-        dim = _resolve_dim(parsed["dimensions"], raw_dim)
-        if not dim or not keyword:
+        phase = _resolve_phase(parsed["dimensions"], raw_phase)
+        if not phase or not keyword:
             continue
 
-        tentative = parsed["dimensions"][dim]["tentative"]
+        tentative = parsed["dimensions"][phase]["tentative"]
         for i, t in enumerate(tentative):
-            if keyword in t.lower():
-                promoted = t
-                parsed["dimensions"][dim]["active"].append(promoted)
+            if _match_lesson_phrase(t, keyword):
+                parsed["dimensions"][phase]["active"].append(t)
                 tentative.pop(i)
                 break
 
     for item in delta.get("flag_deprecated", []):
         if not isinstance(item, dict):
             continue
-        raw_dim = item.get("dimension", "")
+        raw_phase = item.get("phase", "") or item.get("dimension", "")
         keyword = item.get("keyword", "").lower().strip()
         reason = item.get("reason", "").strip()
-        dim = _resolve_dim(parsed["dimensions"], raw_dim)
-        if not dim or not keyword:
+        phase = _resolve_phase(parsed["dimensions"], raw_phase)
+        if not phase or not keyword:
             continue
         for zone in ("active", "tentative"):
-            lst = parsed["dimensions"][dim][zone]
+            lst = parsed["dimensions"][phase][zone]
             for i, line in enumerate(lst):
-                if keyword in line.lower():
+                if _match_lesson_phrase(line, keyword):
                     deprecated_entry = (
                         f"- [DEPRECATED {tag}] {line.lstrip('- ')}"
                         + (f" — {reason}" if reason else "")
                     )
-                    parsed["dimensions"][dim]["deprecated"].append(deprecated_entry)
+                    parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
                     lst.pop(i)
                     break
 
     return parsed
 
 def apply_lesson_delta(role: str, delta: dict, game_id: int):
-    dims = ROLES_CONFIG[role]["dimensions"]
     path = get_lesson_path(role)
     if not os.path.exists(path):
         _init_lesson_file(role)
-    content = open(path, "r", encoding="utf-8").read()
-    parsed = _parse(content, dims)
-    parsed = _apply_delta(parsed, delta, game_id, dims)
+    parsed = _parse_file(path, ROLES_CONFIG[role]["phases"])
+    parsed = _apply_delta(parsed, delta, game_id)
     parsed = _bump_version(parsed, game_id)
-    _write(path, _serialize(parsed, dims))
+    _write(path, _serialize(parsed, ROLES_CONFIG[role]["phases"]))
 
 
 def apply_evil_coord_delta(delta: dict, game_id: int):
     if not os.path.exists(EVIL_COORD_FILE):
         _init_evil_coord()
-    content = open(EVIL_COORD_FILE, "r", encoding="utf-8").read()
-    parsed = _parse(content, EVIL_COORD_DIMENSIONS)
-    parsed = _apply_delta(parsed, delta, game_id, EVIL_COORD_DIMENSIONS)
+    parsed = _parse_file(EVIL_COORD_FILE, EVIL_COORD_PHASES)
+    parsed = _apply_delta(parsed, delta, game_id)
     parsed = _bump_version(parsed, game_id)
-    _write(EVIL_COORD_FILE, _serialize(parsed, EVIL_COORD_DIMENSIONS))
+    _write(EVIL_COORD_FILE, _serialize(parsed, EVIL_COORD_PHASES))
 
 
 def apply_good_coord_delta(delta: dict, game_id: int):
-    """Apply a reflection delta to the good-team coordination memory file."""
     if not os.path.exists(GOOD_COORD_FILE):
         _init_good_coord()
-    content = open(GOOD_COORD_FILE, "r", encoding="utf-8").read()
-    parsed = _parse(content, GOOD_COORD_DIMENSIONS)
-    parsed = _apply_delta(parsed, delta, game_id, GOOD_COORD_DIMENSIONS)
+    parsed = _parse_file(GOOD_COORD_FILE, GOOD_COORD_PHASES)
+    parsed = _apply_delta(parsed, delta, game_id)
     parsed = _bump_version(parsed, game_id)
-    _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_DIMENSIONS))
+    _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_PHASES))
+
+
+def _consolidate_system(role_or_label: str, dim_desc: str, active_max: int, tentative_max: int) -> str:
+    return (
+        f"You are consolidating the strategic memory file for the {role_or_label} role in Avalon.\n"
+        f"This file is organized by GAME PHASE. Phase meanings:\n{dim_desc}\n"
+        f"Each lesson MUST follow the exact format: 'When X, do Y because Z. (observed on WIN|LOSS)' — ≤35 words.\n"
+        f"Rules:\n"
+        f"- Trigger (When X) must be a concrete, observable game state (score, fail count, proposal number, specific player behavior)\n"
+        f"- Action (do Y) must be a specific decision: APPROVE/REJECT, include/exclude player, FAIL/SUCCESS, speech framing, guess target\n"
+        f"- Reason (because Z) must cite game mechanics\n"
+        f"- Phase must match where the trigger occurs and action is taken\n"
+        f"- NO vague filler: reject 'be careful', 'watch everyone', 'trust steady players', 'read the room'\n"
+        f"Ensure each lesson is under 35 words and placed in the correct phase. Be strict."
+    )
+
+
+def _consolidate_user(current: str, active_max: int, tentative_max: int) -> str:
+    return (
+        f"Current lessons file:\n\n{current}\n\n"
+        f"TASKS — apply all strictly:\n"
+        f"1. MERGE & PROMOTE: If 2+ TENTATIVE lessons in the same phase share the same core rule "
+        f"(even if worded differently), merge into ONE sharp 'When X, do Y because Z' rule "
+        f"and PROMOTE to ACTIVE. Combine outcome tags (e.g. 'WIN x2, LOSS x1').\n"
+        f"2. CONTRADICTIONS: If two lessons in the same phase contradict, "
+        f"keep the more specific/actionable one; deprecate the other with reason "
+        f"'contradicts retained lesson'.\n"
+        f"3. PROMOTE BY EVIDENCE: Any TENTATIVE lesson with [gXXX] tags from 2+ distinct games "
+        f"MUST be moved to ACTIVE.\n"
+        f"4. PURGE VAGUE: DELETE any lesson that is vague ('be careful', 'watch everyone'), "
+        f"phase-inappropriate, or factually wrong about game mechanics.\n"
+        f"5. ENFORCE CAPS: ACTIVE max {active_max} per phase. TENTATIVE max {tentative_max} per phase. "
+        f"Excess → DEPRECATED with reason 'cap exceeded — lower priority version'.\n"
+        f"6. OUTCOME RELIABILITY TAGS: Add in parentheses after outcome tag:\n"
+        f"   - '(reliable on WIN, untested on LOSS)' if only WIN tags\n"
+        f"   - '(reliable on LOSS, untested on WIN)' if only LOSS tags\n"
+        f"   - '(robust)' if confirmed on BOTH outcomes\n"
+        f"7. PRESERVE STRUCTURE: Exact file structure — header lines, [phase] tags, "
+        f"ACTIVE:/TENTATIVE:/DEPRECATED: zones.\n\n"
+        'Return JSON only: {"updated_file": "complete updated file as a single string"}'
+    )
+
+
+def _restore_dropped_active(updated_parsed, original_parsed, phases):
+    """Never silently drop pre-existing active lessons during consolidation."""
+    for phase in phases:
+        orig_active = set(original_parsed["dimensions"][phase]["active"])
+        new_active = set(updated_parsed["dimensions"][phase]["active"])
+        new_deprecated = set(updated_parsed["dimensions"][phase]["deprecated"])
+        for lesson in orig_active:
+            if lesson not in new_active and lesson not in new_deprecated:
+                updated_parsed["dimensions"][phase]["active"].append(lesson)
+    return updated_parsed
+
 
 def consolidate_lessons(role: str, llm, game_id: int):
-    """
-    LLM-driven consolidation pass for a single role's lesson file.
-    Merges near-duplicate tentative lessons, resolves contradictions,
-    promotes stable patterns to active, removes vague entries, and
-    enforces per-dimension caps.
-    """
+    """LLM-driven consolidation pass for a single role's phase-bucketed lesson file."""
     from agents.llm_client import call_llm_json
     path = get_lesson_path(role)
     if not os.path.exists(path):
         return
     current = open(path, "r", encoding="utf-8").read()
-    dims = ROLES_CONFIG[role]["dimensions"]
+    phases = ROLES_CONFIG[role]["phases"]
 
-    dim_desc = "\n".join(f"  {d}: {DIMENSION_DESCRIPTIONS[d]}" for d in dims)
-    system = (
-        f"You are consolidating a strategic memory file for the {role} role in Avalon.\n"
-        f"Dimension definitions:\n{dim_desc}\n"
-        "Ensure each lesson is under 40 words and placed in the correct dimension. Be strict."
-    )
-    user = (
-        f"Current lessons file for {role}:\n\n{current}\n\n"
-        f"TASKS — apply all strictly:\n"
-        f"1. MERGE: If 2+ TENTATIVE lessons in the same dimension share the same core rule "
-        f"(even if worded differently), merge into one sharp 'When X, do Y because Z' rule "
-        f"and PROMOTE it to ACTIVE. Combine any outcome tags (e.g. 'WIN x2, LOSS x1').\n"
-        f"2. CONTRADICTIONS: If two lessons in the same dimension contradict each other, "
-        f"keep the more specific/actionable one; deprecate the other with reason "
-        f"'contradicts retained lesson'.\n"
-        f"3. PROMOTE: Any TENTATIVE lesson confirmed across 2+ games (check [g00X] tags) "
-        f"must be moved to ACTIVE.\n"
-        f"4. REMOVE VAGUE: Delete any lesson that is vague (e.g. 'be careful', "
-        f"'watch everyone'), role-inappropriate, or factually wrong about game mechanics.\n"
-        f"5. CAPS: ACTIVE max {ACTIVE_CAP} per dimension. TENTATIVE max {TENTATIVE_CAP} per dimension. "
-        f"Excess lessons go to DEPRECATED with reason 'cap exceeded — lower priority version'.\n"
-        f"6. OUTCOME ANALYSIS: If a lesson is tagged only WIN or only LOSS across many games, "
-        f"add a note in parentheses: e.g. '(reliable on WIN, untested on LOSS)'. "
-        f"Lessons confirmed on BOTH outcomes get a '(robust)' tag.\n"
-        f"7. Preserve exact file structure: header lines, [dimension] tags, "
-        f"ACTIVE:/TENTATIVE:/DEPRECATED: zones.\n\n"
-        'Return JSON only: {"updated_file": "complete updated file as a single string"}'
-    )
+    # Apply lesson aging before consolidation
+    parsed = _parse(current, phases)
+    for phase in phases:
+        for zone in ("active", "tentative"):
+            lst = parsed["dimensions"][phase][zone]
+            updated = []
+            for lesson in lst:
+                weight = _calculate_lesson_weight(lesson, game_id)
+                if weight < LESSON_DECAY_THRESHOLD:
+                    # Auto-deprecate stale lessons
+                    deprecated_entry = (
+                        f"- [DEPRECATED g{game_id:03d}] {lesson.lstrip('- ')}"
+                        f" — auto-deprecated: weight {weight:.2f} below threshold"
+                    )
+                    parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
+                else:
+                    updated.append(lesson)
+            parsed["dimensions"][phase][zone] = updated
+    current = _serialize(parsed, phases)
+
+    dim_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
+    system = _consolidate_system(role, dim_desc, ACTIVE_CAP, TENTATIVE_CAP)
+    user = _consolidate_user(current, ACTIVE_CAP, TENTATIVE_CAP)
     result = call_llm_json(llm, system, user)
     updated = result.get("updated_file", "")
     if not updated or len(updated) < 100:
-        return  # LLM failed — preserve existing file untouched
+        return
 
-    updated_parsed = _parse(updated, dims)
-    original_parsed = _parse(current, dims)
-
-    # Merge: never drop active lessons that existed before consolidation
-    for dim in dims:
-        orig_active = set(original_parsed["dimensions"][dim]["active"])
-        new_active = set(updated_parsed["dimensions"][dim]["active"])
-        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
-        # Restore any active lesson that was silently dropped (not explicitly deprecated)
-        for lesson in orig_active:
-            if lesson not in new_active and lesson not in new_deprecated:
-                updated_parsed["dimensions"][dim]["active"].append(lesson)
-
+    updated_parsed = _parse(updated, phases)
+    original_parsed = _parse(current, phases)
+    updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
+    # Filter out any LLM-produced invalid lessons
+    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
     updated_parsed = _bump_version(updated_parsed, game_id)
-    _write(path, _serialize(updated_parsed, dims))
+    _write(path, _serialize(updated_parsed, phases))
+
+
+def _consolidate_coord(kind: str, phases, llm, game_id: int):
+    from agents.llm_client import call_llm_json
+    path = EVIL_COORD_FILE if kind == "evil" else GOOD_COORD_FILE
+    if not os.path.exists(path):
+        return
+    current = open(path, "r", encoding="utf-8").read()
+    dim_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
+    system = _consolidate_system(f"{kind} coordination", dim_desc, 3, 2)
+    user = _consolidate_user(current, 3, 2)
+    result = call_llm_json(llm, system, user)
+    updated = result.get("updated_file", "")
+    if not updated or len(updated) < 100:
+        return
+    updated_parsed = _parse(updated, phases)
+    original_parsed = _parse(current, phases)
+    updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
+    # Filter out any LLM-produced invalid lessons
+    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
+    updated_parsed = _bump_version(updated_parsed, game_id)
+    _write(path, _serialize(updated_parsed, phases))
 
 
 def consolidate_evil_coord(llm, game_id: int):
-    """LLM-driven consolidation for the evil coordination memory file."""
-    from agents.llm_client import call_llm_json
-    if not os.path.exists(EVIL_COORD_FILE):
-        return
-    current = open(EVIL_COORD_FILE, "r", encoding="utf-8").read()
-    system = (
-        "You are consolidating an evil team coordination memory file for Avalon. "
-        "Be strict. Preserve outcome tags."
-    )
-    user = (
-        f"{current}\n\n"
-        f"TASKS:\n"
-        f"1. Merge near-duplicate lessons into one sharp rule; promote merged result to ACTIVE.\n"
-        f"2. Resolve contradictions — keep more specific/actionable, deprecate the other.\n"
-        f"3. Remove vague lessons.\n"
-        f"4. ACTIVE max 3 per dimension. TENTATIVE max 2 per dimension.\n"
-        f"5. Add outcome reliability notes: (robust) if confirmed on both WIN and LOSS.\n"
-        f"Preserve structure.\n\n"
-        'Return JSON only: {"updated_file": "complete file content"}'
-    )
-    result = call_llm_json(llm, system, user)
-    updated = result.get("updated_file", "")
-    if not updated or len(updated) < 100:
-        return
-    updated_parsed = _parse(updated, EVIL_COORD_DIMENSIONS)
-    original_parsed = _parse(current, EVIL_COORD_DIMENSIONS)
-    for dim in EVIL_COORD_DIMENSIONS:
-        orig_active = set(original_parsed["dimensions"][dim]["active"])
-        new_active = set(updated_parsed["dimensions"][dim]["active"])
-        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
-        for lesson in orig_active:
-            if lesson not in new_active and lesson not in new_deprecated:
-                updated_parsed["dimensions"][dim]["active"].append(lesson)
-    updated_parsed = _bump_version(updated_parsed, game_id)
-    _write(EVIL_COORD_FILE, _serialize(updated_parsed, EVIL_COORD_DIMENSIONS))
+    return _consolidate_coord("evil", EVIL_COORD_PHASES, llm, game_id)
 
 
 def consolidate_good_coord(llm, game_id: int):
-    """LLM-driven consolidation for the good team coordination memory file."""
-    from agents.llm_client import call_llm_json
-    if not os.path.exists(GOOD_COORD_FILE):
-        return
-    current = open(GOOD_COORD_FILE, "r", encoding="utf-8").read()
-    system = (
-        "You are consolidating a good team coordination memory file for Avalon. "
-        "Be strict. Preserve outcome tags."
-    )
-    user = (
-        f"{current}\n\n"
-        f"TASKS:\n"
-        f"1. Merge near-duplicate lessons into one sharp rule; promote merged result to ACTIVE.\n"
-        f"2. Resolve contradictions — keep more specific/actionable, deprecate the other.\n"
-        f"3. Remove vague lessons.\n"
-        f"4. ACTIVE max 3 per dimension. TENTATIVE max 2 per dimension.\n"
-        f"5. Add outcome reliability notes: (robust) if confirmed on both WIN and LOSS.\n"
-        f"Preserve structure.\n\n"
-        'Return JSON only: {"updated_file": "complete file content"}'
-    )
-    result = call_llm_json(llm, system, user)
-    updated = result.get("updated_file", "")
-    if not updated or len(updated) < 100:
-        return
-    updated_parsed = _parse(updated, GOOD_COORD_DIMENSIONS)
-    original_parsed = _parse(current, GOOD_COORD_DIMENSIONS)
-    for dim in GOOD_COORD_DIMENSIONS:
-        orig_active = set(original_parsed["dimensions"][dim]["active"])
-        new_active = set(updated_parsed["dimensions"][dim]["active"])
-        new_deprecated = set(updated_parsed["dimensions"][dim]["deprecated"])
-        for lesson in orig_active:
-            if lesson not in new_active and lesson not in new_deprecated:
-                updated_parsed["dimensions"][dim]["active"].append(lesson)
-    updated_parsed = _bump_version(updated_parsed, game_id)
-    _write(GOOD_COORD_FILE, _serialize(updated_parsed, GOOD_COORD_DIMENSIONS))
+    return _consolidate_coord("good", GOOD_COORD_PHASES, llm, game_id)
+
 
 def should_consolidate_now(tentative_threshold: int = CONSOLIDATION_THRESHOLD) -> bool:
-    """
-    Returns True if any role file OR either coordination file has a dimension
-    that has hit the tentative cap.  Checks all files so consolidation is not
-    missed due to a single slow-accumulating role.
-    """
-    # Individual role files
+    """True if any role file OR either coordination file has a phase whose tentative
+    count has hit the threshold. Checks all files so consolidation isn't missed."""
     for role in ALL_ROLES:
         path = get_lesson_path(role)
         if not os.path.exists(path):
             continue
-        content = open(path, "r", encoding="utf-8").read()
-        dims = ROLES_CONFIG[role]["dimensions"]
-        parsed = _parse(content, dims)
-        for dim in dims:
-            if len(parsed["dimensions"][dim]["tentative"]) >= tentative_threshold:
+        parsed = _parse_file(path, ROLES_CONFIG[role]["phases"])
+        for p in ROLES_CONFIG[role]["phases"]:
+            if len(parsed["dimensions"][p]["tentative"]) >= tentative_threshold:
                 return True
 
-    # Evil coordination file
-    if os.path.exists(EVIL_COORD_FILE):
-        content = open(EVIL_COORD_FILE, "r", encoding="utf-8").read()
-        parsed = _parse(content, EVIL_COORD_DIMENSIONS)
-        for dim in EVIL_COORD_DIMENSIONS:
-            if len(parsed["dimensions"][dim]["tentative"]) >= tentative_threshold:
-                return True
-
-    # Good coordination file
-    if os.path.exists(GOOD_COORD_FILE):
-        content = open(GOOD_COORD_FILE, "r", encoding="utf-8").read()
-        parsed = _parse(content, GOOD_COORD_DIMENSIONS)
-        for dim in GOOD_COORD_DIMENSIONS:
-            if len(parsed["dimensions"][dim]["tentative"]) >= tentative_threshold:
+    for label, filepath, phases in [
+        ("evil", EVIL_COORD_FILE, EVIL_COORD_PHASES),
+        ("good", GOOD_COORD_FILE, GOOD_COORD_PHASES),
+    ]:
+        if not os.path.exists(filepath):
+            continue
+        parsed = _parse_file(filepath, phases)
+        for p in phases:
+            if len(parsed["dimensions"][p]["tentative"]) >= tentative_threshold:
                 return True
 
     return False
 
 
 def get_lesson_stats() -> dict:
-    """
-    Returns a summary dict of lesson counts per role and coordination file,
-    broken down by active / tentative / deprecated.
-    Useful for monitoring learning health across games.
-    """
+    """Per-phase lesson counts (active / tentative / deprecated) for every role and
+    coordination file, plus phase totals. Used for monitoring learning health."""
     stats = {}
 
     for role in ALL_ROLES:
         path = get_lesson_path(role)
+        phases = ROLES_CONFIG[role]["phases"]
         if not os.path.exists(path):
-            stats[role] = {"active": 0, "tentative": 0, "deprecated": 0}
+            stats[role] = {"active": 0, "tentative": 0, "deprecated": 0, "by_phase": {}}
             continue
-        content = open(path, "r", encoding="utf-8").read()
-        dims = ROLES_CONFIG[role]["dimensions"]
-        parsed = _parse(content, dims)
+        parsed = _parse_file(path, phases)
         totals = {"active": 0, "tentative": 0, "deprecated": 0}
-        for dim in dims:
-            for zone in ("active", "tentative", "deprecated"):
-                totals[zone] += len(parsed["dimensions"][dim][zone])
-        stats[role] = totals
+        by_phase = {}
+        for p in phases:
+            zone_counts = {z: len(parsed["dimensions"][p][z]) for z in ("active", "tentative", "deprecated")}
+            by_phase[p] = zone_counts
+            for z in ("active", "tentative", "deprecated"):
+                totals[z] += zone_counts[z]
+        stats[role] = {**totals, "by_phase": by_phase}
 
-    for label, filepath, dimensions in [
-        ("evil_coord", EVIL_COORD_FILE, EVIL_COORD_DIMENSIONS),
-        ("good_coord", GOOD_COORD_FILE, GOOD_COORD_DIMENSIONS),
+    for label, filepath, phases in [
+        ("evil_coord", EVIL_COORD_FILE, EVIL_COORD_PHASES),
+        ("good_coord", GOOD_COORD_FILE, GOOD_COORD_PHASES),
     ]:
         if not os.path.exists(filepath):
-            stats[label] = {"active": 0, "tentative": 0, "deprecated": 0}
+            stats[label] = {"active": 0, "tentative": 0, "deprecated": 0, "by_phase": {}}
             continue
-        content = open(filepath, "r", encoding="utf-8").read()
-        parsed = _parse(content, dimensions)
+        parsed = _parse_file(filepath, phases)
         totals = {"active": 0, "tentative": 0, "deprecated": 0}
-        for dim in dimensions:
-            for zone in ("active", "tentative", "deprecated"):
-                totals[zone] += len(parsed["dimensions"][dim][zone])
-        stats[label] = totals
+        by_phase = {}
+        for p in phases:
+            zone_counts = {z: len(parsed["dimensions"][p][z]) for z in ("active", "tentative", "deprecated")}
+            by_phase[p] = zone_counts
+            for z in ("active", "tentative", "deprecated"):
+                totals[z] += zone_counts[z]
+        stats[label] = {**totals, "by_phase": by_phase}
 
     return stats

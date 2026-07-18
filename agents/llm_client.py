@@ -2,8 +2,19 @@ import json
 import re
 import os
 from datetime import datetime
+from typing import Optional, Type, TypeVar, Dict, Any
 from openai import OpenAI
 from config import NVIDIA_API_KEY, NVIDIA_BASE_URL, MODEL_NAME, GAMEPLAY_MAX_TOKENS, REFLECTION_MAX_TOKENS, LOGS_DIR
+
+try:
+    from pydantic import BaseModel, ValidationError
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    BaseModel = object
+    ValidationError = Exception
+
+T = TypeVar("T", bound="BaseModel")
 
 
 def _make_client() -> OpenAI:
@@ -32,8 +43,7 @@ def _call(llm: dict, messages: list) -> str:
     try:
         response = llm["client"].chat.completions.create(
             model=llm["model"],
-            # messages=messages,
-            messages=[{"role":"user","content":f"{messages}"}],
+            messages=messages,
             temperature=llm["temperature"],
             max_tokens=llm["max_tokens"],
             extra_body={"chat_template_kwargs": {"enable_thinking": True, "clear_thinking": True}},
@@ -45,61 +55,65 @@ def _call(llm: dict, messages: list) -> str:
         return ""
 
 
-def parse_json(text: str) -> dict:
+def _extract_json(text: str) -> str:
+    """Extract first valid JSON object from text, handling markdown fences."""
     if not text:
-        return {}
-
+        return ""
     text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    depth = 0
+    in_string = False
+    escape = False
+    start = -1
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                return text[start:i+1]
+    return ""
 
+
+def _parse_json_strict(text: str) -> Optional[dict]:
+    """Parse JSON strictly, return dict or None."""
     try:
         result = json.loads(text)
-        if isinstance(result, dict):
-            return result
+        return result if isinstance(result, dict) else None
     except json.JSONDecodeError:
-        pass
-
-    valid_candidates: list[dict] = []
-    for start in (m.start() for m in re.finditer(r"\{", text)):
-        depth = 0
-        in_string = False
-        escape = False
-        for i, ch in enumerate(text[start:], start=start):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\" and in_string:
-                escape = True
-                continue
-            if ch == '"' and not escape:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start: i + 1]
-                    try:
-                        result = json.loads(candidate)
-                        if isinstance(result, dict):
-                            valid_candidates.append(result)
-                    except json.JSONDecodeError:
-                        pass
-                    break
-
-    if valid_candidates:
-        return valid_candidates[-1]
-
-    return {}
+        return None
 
 
-def call_llm(llm: dict, system: str, user: str) -> str:
-    return _call(llm, [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ])
+def _validate_output(output: dict, schema: Optional[Type[T]] = None) -> bool:
+    """Validate output dict against Pydantic schema if available."""
+    if not PYDANTIC_AVAILABLE or schema is None:
+        return True
+    try:
+        schema(**output)
+        return True
+    except ValidationError:
+        return False
+
+
+def _format_validation_error(e: ValidationError) -> str:
+    """Format Pydantic validation error for retry prompt."""
+    errors = []
+    for err in e.errors():
+        loc = " -> ".join(str(x) for x in err["loc"])
+        errors.append(f"  {loc}: {err['msg']}")
+    return "Validation errors:\n" + "\n".join(errors)
 
 
 _JSON_SUFFIX = (
@@ -118,8 +132,22 @@ _JSON_SYSTEM_ADDON = (
     "(private_note, internal_note, reasoning, etc.)."
 )
 
+_FORMATTER_SYSTEM = (
+    "You are a JSON repair assistant. You receive a malformed JSON attempt and must "
+    "output ONLY a corrected, valid JSON object matching the implied schema. "
+    "No explanations. No markdown. Start with '{' and end with '}'."
+)
 
-def call_llm_json(llm: dict, system: str, user: str, call_label: str = "") -> dict:
+
+def call_llm_json(
+    llm: dict,
+    system: str,
+    user: str,
+    call_label: str = "",
+    schema: Optional[Type[T]] = None,
+    max_retries: int = 2
+) -> dict:
+    """Call LLM with JSON-enforced output. Validates against schema if provided."""
     augmented_system = system + _JSON_SYSTEM_ADDON
     augmented_user = user + _JSON_SUFFIX
 
@@ -129,48 +157,71 @@ def call_llm_json(llm: dict, system: str, user: str, call_label: str = "") -> di
         {"role": "assistant", "content": "{"},
     ]
 
-    text = _call(llm, messages)
-    result = parse_json("{" + text) if text else {}
-    if result:
-        return result
+    last_text = ""
+    log_path = ""
+    for attempt in range(max_retries + 1):
+        text = _call(llm, messages)
+        last_text = text
+        if not text:
+            continue
 
-    label_str = f" for {call_label}" if call_label else ""
-    warn_message = f"[WARN] Invalid JSON{label_str} — retrying"
-    print(f"    {warn_message}")
+        json_str = _extract_json(text)
+        if not json_str:
+            continue
 
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    log_path = os.path.join(LOGS_DIR, "warns.txt")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"\n{'='*80}\n")
-        f.write(f"Timestamp  : {datetime.utcnow().isoformat()} UTC\n")
-        f.write(f"Warning    : {warn_message}\n")
-        f.write(f"call_label : {call_label}\n")
-        f.write(f"response   : {text}\n")
+        result = _parse_json_strict(json_str)
+        if result and _validate_output(result, schema):
+            return result
 
-    retry_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a JSON formatter. Your only job is to output a single valid JSON object. "
-                "No prose. No markdown. No reasoning. Start with '{' and end with '}'."
-            ),
-        },
-        {"role": "user", "content": f"Output ONLY the JSON object.\n\n{augmented_user}"},
-        {"role": "assistant", "content": "{"},
-    ]
+        # Prepare retry with validation feedback
+        label_str = f" for {call_label}" if call_label else ""
+        warn = f"[WARN] Invalid JSON{label_str} (attempt {attempt+1}/{max_retries+1})"
+        print(f"    {warn}")
 
-    retry_text = _call(llm, retry_messages)
-    retry_result = parse_json("{" + retry_text) if retry_text else {}
-
-    if not retry_result:
-        retry_warn = f"[WARN] Retry also failed{label_str} — using empty result"
-        print(f"    {retry_warn}")
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        log_path = os.path.join(LOGS_DIR, "warns.txt")
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{retry_warn}\nretry_response: {retry_text}\n")
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Timestamp  : {datetime.utcnow().isoformat()} UTC\n")
+            f.write(f"Warning    : {warn}\n")
+            f.write(f"call_label : {call_label}\n")
+            f.write(f"attempt    : {attempt+1}\n")
+            f.write(f"response   : {text}\n")
 
-    return retry_result
+        if attempt < max_retries:
+            retry_user = augmented_user
+            if schema and PYDANTIC_AVAILABLE:
+                try:
+                    model_instance = schema()
+                    schema_json = model_instance.model_json_schema()
+                    retry_user += f"\n\nPrevious output failed validation. Expected JSON schema:\n{json.dumps(schema_json, indent=2)}"
+                except Exception:
+                    pass
 
-def call_llm_json_prefill(llm: dict, system: str, user: str, prefill: str, call_label: str = "") -> dict:
+            messages = [
+                {"role": "system", "content": _FORMATTER_SYSTEM},
+                {"role": "user", "content": retry_user},
+                {"role": "assistant", "content": "{"},
+            ]
+
+    # Final fallback: return empty dict
+    final_label_str = f" for {call_label}" if call_label else ""
+    retry_warn = f"[WARN] All retries failed{final_label_str} — using empty result"
+    print(f"    {retry_warn}")
+    if os.path.exists(log_path):
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{retry_warn}\nlast_response: {last_text}\n")
+    return {}
+
+
+def call_llm_json_prefill(
+    llm: dict,
+    system: str,
+    user: str,
+    prefill: str,
+    call_label: str = "",
+    schema: Optional[Type[T]] = None
+) -> dict:
     """Like call_llm_json but with a custom assistant prefill to force output structure."""
     augmented_system = system + _JSON_SYSTEM_ADDON
     augmented_user = user + _JSON_SUFFIX
@@ -183,21 +234,67 @@ def call_llm_json_prefill(llm: dict, system: str, user: str, prefill: str, call_
 
     text = _call(llm, messages)
     # Strip the prefill from the response if model echoes it back
-    if text.startswith(prefill[1:]):  # prefill starts with '{', text starts after
+    if text.startswith(prefill[1:]):
         text = text[len(prefill) - 1:]
-    result = parse_json(prefill + text) if text else {}
-    if result:
-        return result
+    json_str = _extract_json(text) if text else ""
+    if json_str:
+        result = _parse_json_strict(json_str)
+        if result and _validate_output(result, schema):
+            return result
 
     label_str = f" for {call_label}" if call_label else ""
-    warn_message = f"[WARN] Invalid JSON{label_str} — retrying"
-    print(f"    {warn_message}")
+    warn = f"[WARN] Invalid JSON prefill{label_str} — retrying with formatter"
+    print(f"    {warn}")
     os.makedirs(LOGS_DIR, exist_ok=True)
     log_path = os.path.join(LOGS_DIR, "warns.txt")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*80}\n")
         f.write(f"Timestamp  : {datetime.utcnow().isoformat()} UTC\n")
-        f.write(f"Warning    : {warn_message}\n")
+        f.write(f"Warning    : {warn}\n")
         f.write(f"call_label : {call_label}\n")
         f.write(f"response   : {text}\n")
     return {}
+
+
+def log_llm_call(
+    call_label: str,
+    system: str,
+    user: str,
+    response: str,
+    parsed: dict,
+    game_id: Optional[int] = None,
+    phase: Optional[str] = None,
+    role: Optional[str] = None,
+    slot_id: Optional[int] = None,
+    temperature: float = 0.85,
+    tokens_used: Optional[int] = None,
+):
+    """Log a complete LLM interaction for debugging/analysis."""
+    import json
+    from datetime import datetime
+    from config import LOGS_DIR
+    import re
+
+    os.makedirs(os.path.join(LOGS_DIR, "llm_calls"), exist_ok=True)
+    safe_label = re.sub(r'[^a-zA-Z0-9_-]', '_', call_label)
+    suffix = f"_g{game_id:03d}" if game_id else ""
+    filename = f"{safe_label}{suffix}_{slot_id if slot_id is not None else ''}.jsonl"
+    path = os.path.join(LOGS_DIR, "llm_calls", filename)
+
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "call_label": call_label,
+        "game_id": game_id,
+        "phase": phase,
+        "role": role,
+        "slot_id": slot_id,
+        "temperature": temperature,
+        "tokens_used": tokens_used,
+        "system_prompt": system,
+        "user_prompt": user,
+        "raw_response": response,
+        "parsed_output": parsed,
+    }
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")

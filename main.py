@@ -8,10 +8,11 @@ from config import (
     LESSONS_DIR,
     LOGS_DIR,
     CHECKPOINTS_DIR,
+    STATE_FILE,
 )
 from game.engine import GameEngine
 from agents.llm_client import create_llm, create_reflection_llm
-from memory.manager import ensure_dirs, consolidate_lessons, consolidate_evil_coord
+from memory.manager import ensure_dirs, consolidate_lessons, consolidate_evil_coord, consolidate_good_coord
 from reflection.reflector import run_reflection
 from evaluation.evaluator import (
     load_metrics,
@@ -42,7 +43,7 @@ def run():
 
     llm = create_llm()
     reflection_llm = create_reflection_llm()
-    engine = GameEngine(llm)
+    engine = GameEngine(llm, reflection_llm)
     metrics = load_metrics()
     start_game = load_run_state()
 
@@ -59,6 +60,8 @@ def run():
         for f in [EVIL_COORD_FILE, GOOD_COORD_FILE]:
             if os.path.exists(f):
                 os.remove(f)
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
 
     for game_id in range(start_game, MAX_GAMES + 1):
         state = engine.run_game(game_id)
@@ -90,6 +93,7 @@ def run():
             for role in ALL_ROLES:
                 consolidate_lessons(role, llm, game_id)
             consolidate_evil_coord(llm, game_id)
+            consolidate_good_coord(llm, game_id)
 
         print_stats(metrics["good_wins"], metrics["evil_wins"])
 

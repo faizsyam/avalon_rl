@@ -1,4 +1,5 @@
 import random
+from collections import Counter
 from typing import Dict, List, Tuple
 
 from config import QUEST_TEAM_SIZES, MAX_VOTE_FAILURES, QUESTS_TO_WIN
@@ -12,9 +13,18 @@ from agents.prompts import (
     get_vote_prompt,
     get_mission_prompt,
     get_assassin_prompt,
+    get_analysis_prompt,
 )
-from agents.llm_client import call_llm_json
-from memory.manager import load_lessons, load_evil_coord, load_good_coord
+from agents.llm_client import call_llm_json, log_llm_call
+from agents.schemas import (
+    DiscussionOutput,
+    RejectionReactionOutput,
+    ProposalOutput,
+    VoteOutput,
+    MissionOutput,
+    AssassinOutput,
+    AnalysisOutput,
+)
 from storage.printer import (
     print_game_header, print_quest_header, print_discussion_header,
     print_statement, print_proposal_header, print_proposal,
@@ -27,18 +37,16 @@ from storage.printer import (
 
 
 class GameEngine:
-    def __init__(self, llm):
+    def __init__(self, llm, analysis_llm=None):
         self.llm = llm
+        self.analysis_llm = analysis_llm or llm
         self._system_cache: Dict[str, str] = {}
 
     def _system(self, role: str, state: GameState) -> str:
         if role not in self._system_cache:
             agent_name = state.slot_to_name[state.role_to_slot[role]]
             special_info = self._build_special_info(role, state)
-            lessons = load_lessons(role)
-            evil_coord = load_evil_coord() if ROLES_CONFIG[role]["faction"] == "evil" else ""
-            good_coord = load_good_coord() if ROLES_CONFIG[role]["faction"] == "good" else ""
-            self._system_cache[role] = build_system_prompt(role, agent_name, special_info, lessons, evil_coord, good_coord)
+            self._system_cache[role] = build_system_prompt(role, agent_name, special_info)
         return self._system_cache[role]
 
     def _build_special_info(self, role: str, state: GameState) -> str:
@@ -113,6 +121,8 @@ class GameEngine:
         state.log_lines.append(f"\n--- QUEST {q} (team size: {team_size}, leader: Slot {state.leader_slot}) ---")
         print_quest_header(q, team_size, state.leader_slot, leader_role, state.slot_to_name)
 
+        self._inject_situational_notes(state)
+
         self._run_discussion(state)
 
         approved_team = None
@@ -120,6 +130,7 @@ class GameEngine:
             state.log_lines.append(f"\n[PROPOSAL {attempt + 1}] Leader: Slot {state.leader_slot}")
             print_proposal_header(attempt + 1, state.leader_slot, state.slot_to_role[state.leader_slot], state.slot_to_name)
 
+            self._inject_situational_notes(state)
             team = self._get_proposal(state, team_size)
             votes, speeches = self._get_votes(state, team)
 
@@ -190,6 +201,18 @@ class GameEngine:
                 self._system(role, state),
                 get_discussion_prompt(state, slot),
                 call_label=f"discussion Q{state.quest_num} Slot{slot}",
+                schema=DiscussionOutput,
+            )
+            log_llm_call(
+                f"discussion Q{state.quest_num} Slot{slot}",
+                self._system(role, state),
+                get_discussion_prompt(state, slot),
+                "",  # response not captured here
+                result,
+                game_id=state.game_id,
+                phase="discussion",
+                role=role,
+                slot_id=slot,
             )
             statement = result.get("statement", "").strip() or "..."
             note = result.get("private_note", "")
@@ -199,7 +222,6 @@ class GameEngine:
             name = state.slot_to_name[slot]
             state.log_lines.append(f'  {name} ({role}): "{statement}"')
 
-            # Agent's own subjective note from discussion
             if note:
                 self._append_note(state, slot, f"[Q{state.quest_num} Discussion] {note}")
             print_statement(slot, role, statement, state.slot_to_name)
@@ -207,17 +229,35 @@ class GameEngine:
     def _get_proposal(self, state: GameState, team_size: int) -> List[int]:
         leader = state.leader_slot
         role = state.slot_to_role[leader]
+
+        # Analysis pre-pass before proposing
+        analysis = self._run_analysis_pass(state, leader, f"choosing a {team_size}-person team to propose for Q{state.quest_num}", phase="proposal")
+        if analysis:
+            self._append_note(state, leader, f"[PRE-PROPOSAL ANALYSIS Q{state.quest_num}] {analysis}")
+
         result = call_llm_json(
             self.llm,
             self._system(role, state),
             get_proposal_prompt(state, leader, team_size),
             call_label=f"proposal Q{state.quest_num} Slot{leader}",
+            schema=ProposalOutput,
+        )
+        log_llm_call(
+            f"proposal Q{state.quest_num} Slot{leader}",
+            self._system(role, state),
+            get_proposal_prompt(state, leader, team_size),
+            "",
+            result,
+            game_id=state.game_id,
+            phase="proposal",
+            role=role,
+            slot_id=leader,
         )
         speech = result.get("speech", "").strip() or "This is my pick."
         note = result.get("private_note", "")
         raw_team = result.get("proposed_team", [])
 
-        # Accept names (str) or slot ints from LLM
+        # Accept names (str) or slot ints from LLM; validate strictly
         valid = []
         for item in raw_team:
             if isinstance(item, str) and item in state.name_to_slot:
@@ -228,10 +268,14 @@ class GameEngine:
                 continue
             if s not in valid:
                 valid.append(s)
-        valid = valid[:team_size]
-        while len(valid) < team_size:
-            candidates = [s for s in range(5) if s not in valid]
-            valid.append(random.choice(candidates))
+
+        # Validate team size
+        if len(valid) != team_size:
+            # Fill remaining with random if too few; truncate if too many
+            while len(valid) < team_size:
+                candidates = [s for s in range(5) if s not in valid]
+                valid.append(random.choice(candidates))
+            valid = valid[:team_size]
 
         team_names = [state.slot_to_name[s] for s in valid]
         leader_name = state.slot_to_name[leader]
@@ -239,21 +283,41 @@ class GameEngine:
         if note:
             self._append_note(state, leader, f"[Q{state.quest_num} Proposal] {note}")
         print_proposal(leader, role, valid, speech, state.slot_to_name)
+
         return valid
 
     def _get_votes(self, state: GameState, team: List[int]) -> Tuple[Dict, Dict]:
         votes, speeches = {}, {}
         print_vote_header()
+        team_names = [state.slot_to_name[s] for s in team]
         for slot in range(5):
             role = state.slot_to_role[slot]
+
+            # Analysis pre-pass: deduction isolated from decision
+            analysis = self._run_analysis_pass(state, slot, f"voting on proposed team {team_names}", phase="vote")
+            if analysis:
+                self._append_note(state, slot, f"[PRE-VOTE ANALYSIS Q{state.quest_num}] {analysis}")
+
             result = call_llm_json(
                 self.llm,
                 self._system(role, state),
                 get_vote_prompt(state, slot, state.leader_slot, team),
                 call_label=f"vote Q{state.quest_num} Slot{slot}",
+                schema=VoteOutput,
             )
-            v = result.get("vote", "APPROVE").upper()
-            votes[slot] = v if v in ("APPROVE", "REJECT") else "APPROVE"
+            log_llm_call(
+                f"vote Q{state.quest_num} Slot{slot}",
+                self._system(role, state),
+                get_vote_prompt(state, slot, state.leader_slot, team),
+                "",
+                result,
+                game_id=state.game_id,
+                phase="vote",
+                role=role,
+                slot_id=slot,
+            )
+
+            votes[slot] = result["vote"]
             speeches[slot] = result.get("speech", "").strip() or "..."
             note = result.get("private_note", "")
             if note:
@@ -272,6 +336,18 @@ class GameEngine:
                 self._system(role, state),
                 get_rejection_discussion_prompt(state, slot, rejected_team, vote_record),
                 call_label=f"rejection-react Q{state.quest_num} Slot{slot}",
+                schema=RejectionReactionOutput,
+            )
+            log_llm_call(
+                f"rejection-react Q{state.quest_num} Slot{slot}",
+                self._system(role, state),
+                get_rejection_discussion_prompt(state, slot, rejected_team, vote_record),
+                "",
+                result,
+                game_id=state.game_id,
+                phase="rejection",
+                role=role,
+                slot_id=slot,
             )
             statement = result.get("statement", "").strip() or "..."
             note = result.get("private_note", "")
@@ -290,26 +366,35 @@ class GameEngine:
         for slot in team:
             role = state.slot_to_role[slot]
             if not ROLES_CONFIG[role]["can_fail_mission"]:
-                cards.append("SUCCESS")
-                result = call_llm_json(
-                    self.llm,
-                    self._system(role, state),
-                    get_mission_prompt(state, slot, role, team),
-                    call_label=f"mission Q{state.quest_num} Slot{slot}",
-                )
-                internal = result.get("internal_note", "").strip()
-                if internal:
-                    self._append_note(state, slot, f"[Q{state.quest_num} Mission] {internal}")
+                card = "SUCCESS"
+                # Good always plays SUCCESS — no LLM call; just generate a concise internal note
+                team_names = [state.slot_to_name[s] for s in team]
+                internal = f"Good always plays SUCCESS. Team: {team_names}"
+                self._append_note(state, slot, f"[Q{state.quest_num} Mission] {internal}")
+                cards.append(card)
+                state.log_lines.append(f'  [PRIVATE] Slot {slot} ({role}) played {card}: "{internal}"')
+                print_mission_private(slot, role, card, internal, state.slot_to_name)
             else:
                 result = call_llm_json(
                     self.llm,
                     self._system(role, state),
                     get_mission_prompt(state, slot, role, team),
                     call_label=f"mission Q{state.quest_num} Slot{slot}",
+                    schema=MissionOutput,
+                )
+                log_llm_call(
+                    f"mission Q{state.quest_num} Slot{slot}",
+                    self._system(role, state),
+                    get_mission_prompt(state, slot, role, team),
+                    "",
+                    result,
+                    game_id=state.game_id,
+                    phase="mission",
+                    role=role,
+                    slot_id=slot,
                 )
                 raw_card = result.get("card", "SUCCESS").strip().upper()
-                # Defensive parse: accept any string containing FAIL or SUCCESS
-                if "FAIL" in raw_card:
+                if raw_card == "FAIL":
                     card = "FAIL"
                 else:
                     card = "SUCCESS"
@@ -344,13 +429,23 @@ class GameEngine:
         state.log_lines.append("\n--- ASSASSIN'S CHOICE ---")
         print_assassin_phase(assassin_slot, "Assassin", state.slot_to_name)
 
-        lessons = load_lessons("Assassin")
-        evil_coord = load_evil_coord()
         result = call_llm_json(
             self.llm,
             self._system("Assassin", state),
             get_assassin_prompt(state, assassin_slot),
             call_label="assassin guess",
+            schema=AssassinOutput,
+        )
+        log_llm_call(
+            "assassin guess",
+            self._system("Assassin", state),
+            get_assassin_prompt(state, assassin_slot),
+            "",
+            result,
+            game_id=state.game_id,
+            phase="assassin",
+            role="Assassin",
+            slot_id=assassin_slot,
         )
         guess_name = result.get("guess_name", "")
         reasoning = result.get("reasoning", "").strip() or "..."
@@ -374,3 +469,62 @@ class GameEngine:
         state.log_lines.append(f'Reasoning: "{reasoning}"')
         state.log_lines.append(f"Merlin was {merlin_name}. Correct: {state.assassin_correct}")
         print_assassin_guess(guess, reasoning, merlin_slot, state.assassin_correct, state.slot_to_name)
+
+    def _run_analysis_pass(self, state: GameState, slot: int, context_hint: str, phase: str = "vote") -> str:
+        """Isolated deduction call at low temperature before an action decision.
+        Result is injected into agent notes so it appears in the next prompt's context.
+        `phase` = which decision phase this analysis precedes ('proposal' or 'vote')."""
+        role = state.slot_to_role[slot]
+        result = call_llm_json(
+            self.analysis_llm,
+            self._system(role, state),
+            get_analysis_prompt(state, slot, context_hint, phase),
+            call_label=f"analysis Q{state.quest_num} Slot{slot}",
+        )
+        if not result:
+            return ""
+        parts = []
+        if result.get("certain_facts"):
+            parts.append(f"CERTAIN: {result['certain_facts']}")
+        if result.get("suspicion_model"):
+            parts.append(f"READS: {result['suspicion_model']}")
+        if result.get("contradiction"):
+            parts.append(f"CONTRADICTION DETECTED: {result['contradiction']}")
+        if result.get("priority"):
+            parts.append(f"THIS ROUND PRIORITY: {result['priority']}")
+        return "\n".join(parts)
+
+    def _inject_situational_notes(self, state: GameState):
+        """Inject factual consequence reminders into agent notes before decisions.
+        No decisions are made here — only information is surfaced."""
+
+        proposal_num = len([v for v in state.vote_history if v.quest_num == state.quest_num]) + 1
+
+        for slot in range(5):
+            role = state.slot_to_role[slot]
+            faction = ROLES_CONFIG[role]["faction"]
+
+            if proposal_num == 5 and faction == "good":
+                self._append_note(state, slot,
+                    f"[SITUATION Q{state.quest_num}P5] This is proposal 5/5. "
+                    "If the majority rejects it, evil wins the entire game immediately — regardless of team composition."
+                )
+
+            # Merlin fingerprint detection — inform, do not direct.
+            if role == "Merlin":
+                prior_merlin_teams = [
+                    frozenset(v.proposed_team)
+                    for v in state.vote_history
+                    if v.proposer_slot == slot
+                ]
+                if len(prior_merlin_teams) >= 2:
+                    counts = Counter(prior_merlin_teams)
+                    prior_summaries = [
+                        [state.slot_to_name[s] for s in team] for team, _ in counts.items()
+                    ]
+                    if prior_summaries:
+                        self._append_note(state, slot,
+                            f"[MERLIN FINGERPRINT WARNING] You have previously proposed these "
+                            f"team(s): {prior_summaries}. Repeating a composition is one signal "
+                            "the Assassin tracks — but so is wildly varying teams. Use your judgment."
+                        )
