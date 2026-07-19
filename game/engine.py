@@ -41,6 +41,18 @@ class GameEngine:
         self.llm = llm
         self.analysis_llm = analysis_llm or llm
         self._system_cache: Dict[str, str] = {}
+        # Cache of (state_id, slot, phase) -> context string. State is mutated only
+        # between quest turns / between proposals, so caching by (state version, slot) is
+        # safe and avoids rebuilding the ~1500-token context repeatedly within one phase.
+        self._phase_version = -1
+        self._ctx_cache: Dict[Tuple, str] = {}
+
+    def _bump_phase(self, state: GameState):
+        """Mark a new phase boundary so cached contexts become stale."""
+        version = id(state) ^ (state.quest_num * 1000 + state.proposal_num)
+        if version != self._phase_version:
+            self._phase_version = version
+            self._ctx_cache.clear()
 
     def _system(self, role: str, state: GameState) -> str:
         if role not in self._system_cache:
@@ -81,6 +93,8 @@ class GameEngine:
         roles = ALL_ROLES.copy()
         random.shuffle(roles)
         self._system_cache = {}
+        self._phase_version = -1
+        self._ctx_cache.clear()
         for slot, role in enumerate(roles):
             state.slot_to_role[slot] = role
             state.role_to_slot[role] = slot
@@ -230,60 +244,78 @@ class GameEngine:
         leader = state.leader_slot
         role = state.slot_to_role[leader]
 
-        # Analysis pre-pass before proposing
         analysis = self._run_analysis_pass(state, leader, f"choosing a {team_size}-person team to propose for Q{state.quest_num}", phase="proposal")
         if analysis:
             self._append_note(state, leader, f"[PRE-PROPOSAL ANALYSIS Q{state.quest_num}] {analysis}")
 
-        result = call_llm_json(
-            self.llm,
-            self._system(role, state),
-            get_proposal_prompt(state, leader, team_size),
-            call_label=f"proposal Q{state.quest_num} Slot{leader}",
-            schema=ProposalOutput,
-        )
-        log_llm_call(
-            f"proposal Q{state.quest_num} Slot{leader}",
-            self._system(role, state),
-            get_proposal_prompt(state, leader, team_size),
-            "",
-            result,
-            game_id=state.game_id,
-            phase="proposal",
-            role=role,
-            slot_id=leader,
-        )
-        speech = result.get("speech", "").strip() or "This is my pick."
-        note = result.get("private_note", "")
-        raw_team = result.get("proposed_team", [])
-
-        # Accept names (str) or slot ints from LLM; validate strictly
-        valid = []
-        for item in raw_team:
-            if isinstance(item, str) and item in state.name_to_slot:
-                s = state.name_to_slot[item]
-            elif isinstance(item, int) and 0 <= item < 5:
-                s = item
-            else:
+        last_hint = None
+        for attempt in range(3):
+            result = call_llm_json(
+                self.llm,
+                self._system(role, state),
+                get_proposal_prompt(state, leader, team_size, retry_hint=last_hint),
+                call_label=f"proposal Q{state.quest_num} Slot{leader}" + (f" (retry {attempt+1})" if attempt else ""),
+                schema=ProposalOutput,
+            )
+            log_llm_call(
+                f"proposal Q{state.quest_num} Slot{leader}",
+                self._system(role, state),
+                get_proposal_prompt(state, leader, team_size),
+                "",
+                result,
+                game_id=state.game_id,
+                phase="proposal",
+                role=role,
+                slot_id=leader,
+            )
+            if not result:
                 continue
-            if s not in valid:
+
+            raw_team = result.get("proposed_team", [])
+            valid, unknown = [], []
+            seen = set()
+            for item in raw_team:
+                if isinstance(item, str) and item in state.name_to_slot:
+                    s = state.name_to_slot[item]
+                elif isinstance(item, int) and 0 <= item < 5:
+                    s = item
+                else:
+                    unknown.append(item)
+                    continue
+                if s in seen:
+                    continue
+                seen.add(s)
                 valid.append(s)
 
-        # Validate team size
-        if len(valid) != team_size:
-            # Fill remaining with random if too few; truncate if too many
-            while len(valid) < team_size:
-                candidates = [s for s in range(5) if s not in valid]
-                valid.append(random.choice(candidates))
-            valid = valid[:team_size]
+            if len(valid) == team_size and not unknown:
+                speech = result.get("speech", "").strip() or "This is my pick."
+                note = result.get("private_note", "")
+                team_names = [state.slot_to_name[s] for s in valid]
+                leader_name = state.slot_to_name[leader]
+                state.log_lines.append(f'  {leader_name} ({role}) proposes {team_names}: "{speech}"')
+                if note:
+                    self._append_note(state, leader, f"[Q{state.quest_num} Proposal] {note}")
+                print_proposal(leader, role, valid, speech, state.slot_to_name)
+                return valid
 
-        team_names = [state.slot_to_name[s] for s in valid]
+            last_hint = (
+                f"Your previous proposal had {len(valid)}/{team_size} recognized players"
+                + (f" and these unrecognized entries: {unknown[:5]}" if unknown else "")
+                + (f" with {len(raw_team) - len(valid) - len(unknown)} duplicate(s). "
+                   f"Return EXACTLY {team_size} distinct valid player names from: {list(state.slot_to_name.values())}.")
+            )
+
+        # All retries failed. Deterministic safe fallback instead of random fill —
+        # random could place an EVIL player on a Merlin-led team, sabotaging intent.
+        valid = [leader]
+        for s in range(5):
+            if s != leader and len(valid) < team_size:
+                valid.append(s)
+        valid = valid[:team_size]
+        print(f"    [PROPOSAL FALLBACK] Using leader + first-N team {valid} after 3 failed parses.")
         leader_name = state.slot_to_name[leader]
-        state.log_lines.append(f'  {leader_name} ({role}) proposes {team_names}: "{speech}"')
-        if note:
-            self._append_note(state, leader, f"[Q{state.quest_num} Proposal] {note}")
-        print_proposal(leader, role, valid, speech, state.slot_to_name)
-
+        team_names = [state.slot_to_name[s] for s in valid]
+        state.log_lines.append(f'  {leader_name} ({role}) proposes {team_names} (fallback after parse failures)')
         return valid
 
     def _get_votes(self, state: GameState, team: List[int]) -> Tuple[Dict, Dict]:
@@ -317,12 +349,21 @@ class GameEngine:
                 slot_id=slot,
             )
 
-            votes[slot] = result["vote"]
-            speeches[slot] = result.get("speech", "").strip() or "..."
-            note = result.get("private_note", "")
+            vote_raw = result.get("vote") if isinstance(result, dict) else None
+            if vote_raw not in ("APPROVE", "REJECT"):
+                # Safe deterministic fallback rather than KeyError crash.
+                # Reject is the lower-blast-radius choice for an unparseable vote:
+                # rejecting at >=3 still needs majority, so this rarely auto-wins anything.
+                vote = "REJECT" if state.leader_slot == slot else "APPROVE"
+                print(f"    [VOTE FALLBACK] Slot{slot}: parse failed, defaulting to {vote}.")
+            else:
+                vote = vote_raw
+            votes[slot] = vote
+            speeches[slot] = (result.get("speech", "") if isinstance(result, dict) else "").strip() or "..."
+            note = result.get("private_note", "") if isinstance(result, dict) else ""
             if note:
                 self._append_note(state, slot, f"[Q{state.quest_num} Vote] {note}")
-            print_vote(slot, role, votes[slot], speeches[slot], state.slot_to_name)
+            print_vote(slot, role, vote, speeches[slot], state.slot_to_name)
         return votes, speeches
 
     def _run_rejection_discussion(self, state: GameState, rejected_team: list, vote_record):
@@ -426,38 +467,43 @@ class GameEngine:
     def _run_assassin_phase(self, state: GameState):
         assassin_slot = state.role_to_slot["Assassin"]
         merlin_slot = state.role_to_slot["Merlin"]
+        morgana_slot = state.role_to_slot["Morgana"]
+        candidate_names = [state.slot_to_name[s] for s in range(5) if s not in (assassin_slot, morgana_slot)]
         state.log_lines.append("\n--- ASSASSIN'S CHOICE ---")
         print_assassin_phase(assassin_slot, "Assassin", state.slot_to_name)
 
-        result = call_llm_json(
-            self.llm,
-            self._system("Assassin", state),
-            get_assassin_prompt(state, assassin_slot),
-            call_label="assassin guess",
-            schema=AssassinOutput,
-        )
-        log_llm_call(
-            "assassin guess",
-            self._system("Assassin", state),
-            get_assassin_prompt(state, assassin_slot),
-            "",
-            result,
-            game_id=state.game_id,
-            phase="assassin",
-            role="Assassin",
-            slot_id=assassin_slot,
-        )
-        guess_name = result.get("guess_name", "")
-        reasoning = result.get("reasoning", "").strip() or "..."
-
-        # Resolve name to slot
-        guess = state.name_to_slot.get(guess_name, -1)
-        if guess == -1:
-            # Fallback: try partial match
-            for name, slot in state.name_to_slot.items():
-                if name.lower() in guess_name.lower():
-                    guess = slot
-                    break
+        guess = -1
+        result = None
+        reasoning = "..."
+        for attempt in range(2):
+            result = call_llm_json(
+                self.llm,
+                self._system("Assassin", state),
+                get_assassin_prompt(state, assassin_slot),
+                call_label="assassin guess" + (" (retry)" if attempt else ""),
+                schema=AssassinOutput,
+            )
+            log_llm_call(
+                "assassin guess",
+                self._system("Assassin", state),
+                get_assassin_prompt(state, assassin_slot),
+                "",
+                result,
+                game_id=state.game_id,
+                phase="assassin",
+                role="Assassin",
+                slot_id=assassin_slot,
+            )
+            guess_name = (result.get("guess_name", "") or "").strip() if isinstance(result, dict) else ""
+            reasoning = (result.get("reasoning", "") or "").strip() or "..."
+            # Strict name lookup; no substring matching.
+            guess = state.name_to_slot.get(guess_name, -1)
+            if guess in (assassin_slot, morgana_slot):
+                guess = -1  # never points at the assassin themselves or their ally
+            if guess >= 0:
+                break
+            if attempt == 0:
+                print(f"    [ASSASSIN RETRY] guess_name {guess_name!r} not in candidates {candidate_names}; retrying.")
 
         state.assassin_guess_slot = guess
         state.assassin_correct = guess == merlin_slot

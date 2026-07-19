@@ -4,17 +4,12 @@ from typing import Dict, List, Optional
 
 from config import LESSONS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
 from game.roles import ROLES_CONFIG, EVIL_COORD_PHASES, GOOD_COORD_PHASES, ALL_ROLES, PHASE_DESCRIPTIONS
+from agents.llm_client import call_llm_json
 
 # Per-phase caps: shared by lesson files and coordination files alike.
 TENTATIVE_CAP = 5
 ACTIVE_CAP = 5
 CONSOLIDATION_THRESHOLD = 3
-
-# Lesson aging / decay
-LESSON_MAX_AGE = 50
-LESSON_DECAY_RATE = 0.95
-LESSON_DECAY_THRESHOLD = 0.2
-WIN_LOSS_WEIGHT_BOOST = 1.2
 
 # All phase names that may appear in lesson files (validation / debugging).
 PHASES_ALL = ("discussion", "proposal", "vote", "mission", "assassin")
@@ -91,11 +86,6 @@ def validate_lesson(lesson: str, phase: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _validate_lesson_format(lesson: str, phase: str) -> bool:
-    """Backwards-compatible boolean wrapper. New code should call validate_lesson."""
-    return validate_lesson(lesson, phase)[0]
-
-
 def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
     """Remove any invalid lessons from active/tentative zones after LLM consolidation."""
     for phase in phases:
@@ -103,7 +93,8 @@ def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
             lst = parsed["dimensions"][phase][zone]
             valid = []
             for lesson in lst:
-                if _validate_lesson_format(lesson, phase):
+                ok, _ = validate_lesson(lesson, phase)
+                if ok:
                     valid.append(lesson)
                 else:
                     # Move invalid to deprecated
@@ -126,30 +117,19 @@ def get_lesson_path(role: str) -> str:
 
 def _init_lesson_file(role: str) -> str:
     phases = ROLES_CONFIG[role]["phases"]
-    content = _serialize({
-        "header": [f"=== {role.upper()} LESSONS ===", "version: 0", "last_updated: none"],
-        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in phases}
-    }, phases)
-    _write(get_lesson_path(role), content)
-    return content
+    path = get_lesson_path(role)
+    _init_file(path, role.upper(), phases)
+    return open(path).read()
 
 
 def _init_evil_coord() -> str:
-    content = _serialize({
-        "header": ["=== EVIL COORDINATION MEMORY ===", "version: 0", "last_updated: none"],
-        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in EVIL_COORD_PHASES}
-    }, EVIL_COORD_PHASES)
-    _write(EVIL_COORD_FILE, content)
-    return content
+    _init_file(EVIL_COORD_FILE, "EVIL COORDINATION MEMORY", EVIL_COORD_PHASES)
+    return open(EVIL_COORD_FILE).read()
 
 
 def _init_good_coord() -> str:
-    content = _serialize({
-        "header": ["=== GOOD COORDINATION MEMORY ===", "version: 0", "last_updated: none"],
-        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in GOOD_COORD_PHASES}
-    }, GOOD_COORD_PHASES)
-    _write(GOOD_COORD_FILE, content)
-    return content
+    _init_file(GOOD_COORD_FILE, "GOOD COORDINATION MEMORY", GOOD_COORD_PHASES)
+    return open(GOOD_COORD_FILE).read()
 
 
 def _parse(content: str, phases: List[str]) -> Dict:
@@ -375,34 +355,6 @@ def _words_in_order(haystack: str, words: List[str]) -> bool:
     return True
 
 
-def _parse_game_tag(lesson: str) -> Optional[int]:
-    """Extract game number from lesson tag like [g005]."""
-    import re
-    match = re.search(r'\[g(\d+)\]', lesson)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def _calculate_lesson_weight(lesson: str, current_game: int) -> float:
-    """Calculate decay weight for a lesson based on age and outcome tagging.
-    Returns weight in (0, 1], lower means more likely to deprecate."""
-    game_num = _parse_game_tag(lesson)
-    if game_num is None:
-        return 1.0
-
-    age = current_game - game_num
-    if age <= LESSON_MAX_AGE:
-        return 1.0
-
-    decay = LESSON_DECAY_RATE ** (age - LESSON_MAX_AGE)
-    weight = max(decay, 0.1)
-
-    if "(observed on WIN" in lesson and "(observed on LOSS" in lesson:
-        weight *= WIN_LOSS_WEIGHT_BOOST
-
-    return min(weight, 1.0)
-
 def _write(path: str, content: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -477,31 +429,37 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
     return parsed
 
 def apply_lesson_delta(role: str, delta: dict, game_id: int):
-    path = get_lesson_path(role)
-    if not os.path.exists(path):
-        _init_lesson_file(role)
-    parsed = _parse_file(path, ROLES_CONFIG[role]["phases"])
-    parsed = _apply_delta(parsed, delta, game_id)
-    parsed = _bump_version(parsed, game_id)
-    _write(path, _serialize(parsed, ROLES_CONFIG[role]["phases"]))
+    _apply_delta_to_path(get_lesson_path(role), ROLES_CONFIG[role]["phases"], delta, game_id)
 
 
 def apply_evil_coord_delta(delta: dict, game_id: int):
-    if not os.path.exists(EVIL_COORD_FILE):
-        _init_evil_coord()
-    parsed = _parse_file(EVIL_COORD_FILE, EVIL_COORD_PHASES)
-    parsed = _apply_delta(parsed, delta, game_id)
-    parsed = _bump_version(parsed, game_id)
-    _write(EVIL_COORD_FILE, _serialize(parsed, EVIL_COORD_PHASES))
+    _apply_delta_to_path(EVIL_COORD_FILE, EVIL_COORD_PHASES, delta, game_id)
 
 
 def apply_good_coord_delta(delta: dict, game_id: int):
-    if not os.path.exists(GOOD_COORD_FILE):
-        _init_good_coord()
-    parsed = _parse_file(GOOD_COORD_FILE, GOOD_COORD_PHASES)
+    _apply_delta_to_path(GOOD_COORD_FILE, GOOD_COORD_PHASES, delta, game_id)
+
+
+def _apply_delta_to_path(path: str, phases: List[str], delta: dict, game_id: int):
+    """Single apply path for role lesson files AND coordination files."""
+    if not os.path.exists(path):
+        # Initialize with the right headers and phase structure on first write.
+        header_label = os.path.basename(path).replace(".txt", "").upper().replace("_", " ")
+        _init_file(path, header_label, phases)
+    parsed = _parse_file(path, phases)
     parsed = _apply_delta(parsed, delta, game_id)
     parsed = _bump_version(parsed, game_id)
-    _write(GOOD_COORD_FILE, _serialize(parsed, GOOD_COORD_PHASES))
+    _write(path, _serialize(parsed, phases))
+
+
+def _init_file(path: str, header_label: str, phases: List[str]):
+    """Initialize any lesson file (per-role or per-faction coordination) with the
+    canonical empty structure."""
+    content = _serialize({
+        "header": [f"=== {header_label} LESSONS ===", "version: 0", "last_updated: none"],
+        "dimensions": {p: {"active": [], "tentative": [], "deprecated": []} for p in phases}
+    }, phases)
+    _write(path, content)
 
 
 def _consolidate_system(role_or_label: str, dim_desc: str, active_max: int, tentative_max: int) -> str:
@@ -559,78 +517,39 @@ def _restore_dropped_active(updated_parsed, original_parsed, phases):
 
 def consolidate_lessons(role: str, llm, game_id: int):
     """LLM-driven consolidation pass for a single role's phase-bucketed lesson file."""
-    from agents.llm_client import call_llm_json
-    path = get_lesson_path(role)
-    if not os.path.exists(path):
-        return
-    current = open(path, "r", encoding="utf-8").read()
-    phases = ROLES_CONFIG[role]["phases"]
-
-    # Apply lesson aging before consolidation
-    parsed = _parse(current, phases)
-    for phase in phases:
-        for zone in ("active", "tentative"):
-            lst = parsed["dimensions"][phase][zone]
-            updated = []
-            for lesson in lst:
-                weight = _calculate_lesson_weight(lesson, game_id)
-                if weight < LESSON_DECAY_THRESHOLD:
-                    # Auto-deprecate stale lessons
-                    deprecated_entry = (
-                        f"- [DEPRECATED g{game_id:03d}] {lesson.lstrip('- ')}"
-                        f" — auto-deprecated: weight {weight:.2f} below threshold"
-                    )
-                    parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
-                else:
-                    updated.append(lesson)
-            parsed["dimensions"][phase][zone] = updated
-    current = _serialize(parsed, phases)
-
-    dim_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
-    system = _consolidate_system(role, dim_desc, ACTIVE_CAP, TENTATIVE_CAP)
-    user = _consolidate_user(current, ACTIVE_CAP, TENTATIVE_CAP)
-    result = call_llm_json(llm, system, user)
-    updated = result.get("updated_file", "")
-    if not updated or len(updated) < 100:
-        return
-
-    updated_parsed = _parse(updated, phases)
-    original_parsed = _parse(current, phases)
-    updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
-    # Filter out any LLM-produced invalid lessons
-    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
-    updated_parsed = _bump_version(updated_parsed, game_id)
-    _write(path, _serialize(updated_parsed, phases))
-
-
-def _consolidate_coord(kind: str, phases, llm, game_id: int):
-    from agents.llm_client import call_llm_json
-    path = EVIL_COORD_FILE if kind == "evil" else GOOD_COORD_FILE
-    if not os.path.exists(path):
-        return
-    current = open(path, "r", encoding="utf-8").read()
-    dim_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
-    system = _consolidate_system(f"{kind} coordination", dim_desc, 3, 2)
-    user = _consolidate_user(current, 3, 2)
-    result = call_llm_json(llm, system, user)
-    updated = result.get("updated_file", "")
-    if not updated or len(updated) < 100:
-        return
-    updated_parsed = _parse(updated, phases)
-    original_parsed = _parse(current, phases)
-    updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
-    # Filter out any LLM-produced invalid lessons
-    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
-    updated_parsed = _bump_version(updated_parsed, game_id)
-    _write(path, _serialize(updated_parsed, phases))
+    consolidate_file(get_lesson_path(role), ROLES_CONFIG[role]["phases"], role, llm, game_id,
+                     active_cap=ACTIVE_CAP, tentative_cap=TENTATIVE_CAP)
 
 
 def consolidate_evil_coord(llm, game_id: int):
-    return _consolidate_coord("evil", EVIL_COORD_PHASES, llm, game_id)
+    consolidate_file(EVIL_COORD_FILE, EVIL_COORD_PHASES, "evil coordination", llm, game_id,
+                     active_cap=3, tentative_cap=2)
 
 
 def consolidate_good_coord(llm, game_id: int):
-    return _consolidate_coord("good", GOOD_COORD_PHASES, llm, game_id)
+    consolidate_file(GOOD_COORD_FILE, GOOD_COORD_PHASES, "good coordination", llm, game_id,
+                     active_cap=3, tentative_cap=2)
+
+
+def consolidate_file(path: str, phases, label: str, llm, game_id: int, active_cap: int, tentative_cap: int):
+    """Single consolidation entry point shared by role and coordination files."""
+    if not os.path.exists(path):
+        return
+    current = open(path, "r", encoding="utf-8").read()
+    dim_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
+    system = _consolidate_system(label, dim_desc, active_cap, tentative_cap)
+    user = _consolidate_user(current, active_cap, tentative_cap)
+    result = call_llm_json(llm, system, user)
+    updated = result.get("updated_file", "")
+    if not updated or len(updated) < 100:
+        return
+
+    updated_parsed = _parse(updated, phases)
+    original_parsed = _parse(current, phases)
+    updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
+    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
+    updated_parsed = _bump_version(updated_parsed, game_id)
+    _write(path, _serialize(updated_parsed, phases))
 
 
 def should_consolidate_now(tentative_threshold: int = CONSOLIDATION_THRESHOLD) -> bool:

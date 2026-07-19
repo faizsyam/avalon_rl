@@ -394,9 +394,6 @@ def _build_game_context(state, my_slot: int) -> str:
     lr = _build_leader_rotation(state)
     if lr:
         parts += [lr, ""]
-    pqs = _build_player_quest_summary(state)
-    if pqs:
-        parts += [pqs, ""]
     vh = _build_vote_history(state)
     if vh:
         parts += [vh, ""]
@@ -408,6 +405,10 @@ def _build_game_context(state, my_slot: int) -> str:
         parts += [notes, ""]
     return "\n".join(parts)
 
+def _build_player_quest_summary_unused(_state) -> str:
+    """Removed; per-player succ/fail markers are now embedded in _build_quest_roadmap."""
+    return ""
+
 def _build_quest_roadmap(state, my_slot: int) -> str:
     completed = {m.quest_num: m for m in state.mission_history}
     lines = ["QUEST ROADMAP:"]
@@ -416,36 +417,38 @@ def _build_quest_roadmap(state, my_slot: int) -> str:
         if q in completed:
             m = completed[q]
             you = " [YOU]" if my_slot in m.team else ""
+            succ_mark = "✓" if m.result == "SUCCESS" else "✗"
             if m.result == "FAIL":
                 if m.num_fails == size:
                     deduction = f" — all {size} members mathematically confirmed evil"
                 else:
                     deduction = f" — at least {m.num_fails} of these {size} players are evil"
             else:
-                deduction = " — no alignment confirmed (evil may have played SUCCESS)"
-            lines.append(f"  Q{q} ({size} players): {[_n(state, s) for s in m.team]} → {m.result} ({m.num_fails} fail(s)){you}{deduction}")
+                deduction = " — success does not confirm anyone as good"
+            lines.append(f"  Q{q} ({size}p) {succ_mark}: {[_n(state, s) for s in m.team]} → {m.result} ({m.num_fails} fail){you}{deduction}")
         elif q == state.quest_num:
             proposal_count = len([v for v in state.vote_history if v.quest_num == q])
-            lines.append(f"  Q{q} ({size} players): ← CURRENT (proposal {proposal_count + 1}/5)")
+            lines.append(f"  Q{q} ({size}p): ← CURRENT (proposal {proposal_count + 1}/5)")
         else:
-            lines.append(f"  Q{q} ({size} players): upcoming")
+            lines.append(f"  Q{q} ({size}p): upcoming")
 
-    role = state.slot_to_role[my_slot]
-    faction = ROLES_CONFIG[role]["faction"]
-    fail_teams = [set(m.team) for m in state.mission_history if m.result == "FAIL"]
+    # Per-player comp across completed quests — replaces the old separate
+    # _build_player_quest_summary block (which produced duplicate information).
+    if state.mission_history:
+        record = {name: [] for name in state.slot_to_name.values()}
+        for m in state.mission_history:
+            for slot in m.team:
+                record[state.slot_to_name[slot]].append(f"Q{m.quest_num}{'✓' if m.result == 'SUCCESS' else '✗'}")
+        lines.append("  —" + "—" * 38)
+        for name, marks in record.items():
+            lines.append(f"  {name}: {' '.join(marks) if marks else 'no quests yet'}")
 
-    if faction == "good":
+    if ROLES_CONFIG[state.slot_to_role[my_slot]]["faction"] == "good":
+        fail_teams = [set(m.team) for m in state.mission_history if m.result == "FAIL"]
         if len(fail_teams) >= 2:
             common = fail_teams[0].intersection(*fail_teams[1:])
-            common_names = [_n(state, s) for s in common]
-            if common_names:
-                lines.append(f"  ⚠ CROSS-QUEST: {common_names} present on EVERY failed quest.")
-    else:
-        evil_slots = {state.role_to_slot["Assassin"], state.role_to_slot["Morgana"]}
-        evil_names = {state.slot_to_name[s] for s in evil_slots}
-        exposed = [n for n in _get_confirmed_evil_names(state) if n in evil_names]
-        if exposed:
-            lines.append(f"  ✗ COVER LOST: {exposed} are publicly confirmed evil.")
+            if common:
+                lines.append(f"  ⚠ CROSS-QUEST: {[_n(state, s) for s in common]} present on EVERY failed quest.")
 
     return "\n".join(lines)
 
@@ -496,78 +499,41 @@ def _get_high_suspicion_names(state) -> list[str]:
 
 
 def _build_confirmed_evil_players(state, my_slot: int) -> str:
+    """Only emit this block for GOOD players — evil players already know who they are,
+    so a block describing public cover-status is zero decision-utility for them."""
     role = state.slot_to_role[my_slot]
     faction = ROLES_CONFIG[role]["faction"]
+    if faction != "good":
+        return ""
     confirmed = _get_confirmed_evil_names(state)
     suspicious = _get_high_suspicion_names(state)
     if not confirmed and not suspicious:
         return ""
-
-    if faction == "good":
-        lines = ["DEDUCTION FROM PUBLIC QUEST MATH:"]
-        if confirmed:
-            lines.append(f"  CONFIRMED EVIL (mathematical proof): {confirmed}")
-        if suspicious:
-            lines.append(f"  HIGH SUSPICION (2+ failed quests): {suspicious}")
-    else:  # evil
-        evil_slots = {state.role_to_slot["Assassin"], state.role_to_slot["Morgana"]}
-        evil_names = {state.slot_to_name[s] for s in evil_slots}
-        lines = ["WHAT THE GROUP CAN DERIVE FROM PUBLIC QUEST MATH:"]
-        if confirmed:
-            exposed_evil = [n for n in confirmed if n in evil_names]
-            exposed_innocent = [n for n in confirmed if n not in evil_names]
-            if exposed_evil:
-                lines.append(f"  YOUR COVER IS BLOWN: {exposed_evil} are publicly confirmed evil.")
-            if exposed_innocent:
-                lines.append(f"  Innocents the group wrongly reads as evil: {exposed_innocent}.")
-        if suspicious:
-            suspected_evil = [n for n in suspicious if n in evil_names]
-            suspected_innocent = [n for n in suspicious if n not in evil_names]
-            if suspected_evil:
-                lines.append(f"  GROUP SUSPECTS (you or your ally): {suspected_evil}.")
-            if suspected_innocent:
-                lines.append(f"  Group suspects innocents: {suspected_innocent}.")
-
+    lines = ["DEDUCTION FROM PUBLIC QUEST MATH:"]
+    if confirmed:
+        lines.append(f"  CONFIRMED EVIL (mathematical proof): {confirmed}")
+    if suspicious:
+        lines.append(f"  HIGH SUSPICION (2+ failed quests): {suspicious}")
     return "\n".join(lines)
 
 def get_analysis_prompt(state, slot_id: int, context_hint: str, phase: str = "vote") -> str:
     """Pre-decision analysis pass. Deduction only — no action decision.
     `phase` = which decision phase this analysis precedes ('proposal' or 'vote'),
-    so the matching phase lessons are surfaced here too."""
+    so the matching phase lessons are surfaced here too. Reuses the game-context
+    builder (which already contains the prior-public-statement history) to avoid
+    duplicating the ~600-token consistency block that was previously here."""
     role = state.slot_to_role[slot_id]
     context = _build_game_context(state, slot_id)
     lessons = _phase_lessons_block(state, role, phase)
 
-    prior_public = []
-    for d in state.discussion_log:
-        if d.slot_id == slot_id:
-            prior_public.append(f'Q{d.quest_num} discussion: "{d.statement}"')
-    for v in state.vote_history:
-        speech = v.speeches.get(slot_id, "").strip()
-        if speech and speech != "...":
-            prior_public.append(f'Q{v.quest_num}P{v.proposal_num} vote [{v.votes.get(slot_id, "?")}]: "{speech}"')
-    for v in state.vote_history:
-        if v.proposer_slot == slot_id:
-            team_names = [state.slot_to_name[s] for s in v.proposed_team]
-            prior_public.append(f'Q{v.quest_num}P{v.proposal_num} YOU PROPOSED: {team_names}')
-
-    consistency_block = ""
-    if prior_public:
-        consistency_block = (
-            "\nYOUR PRIOR PUBLIC STATEMENTS (everything you have said aloud):\n"
-            + "\n".join(f"  {s}" for s in prior_public[-8:])
-            + "\nCheck: does any planned action contradict these? Contradictions destroy credibility.\n"
-        )
-
     return (
         f"{context}"
-        f"{consistency_block}"
         f"{lessons}"
         f"Context for this analysis: {context_hint}\n\n"
         f"TASK — Analyze only. Do not decide your action yet.\n"
         f"1. What does quest math confirm with certainty? (fail counts, team compositions)\n"
         f"2. What is your current read on each player's alignment and why?\n"
-        f"3. Have any players contradicted themselves across rounds? Name them specifically.\n"
+        f"3. Have any players contradicted themselves across rounds? Name them specifically — references to specific past statements are valuable.\n"
         f"4. What is the single most important objective for your faction this round?\n\n"
         f'{{"certain_facts": "mathematical certainties only — no inference", '
         f'"suspicion_model": "your read on each player with specific evidence", '
@@ -636,7 +602,7 @@ def get_rejection_discussion_prompt(state, slot_id: int, rejected_team: list, vo
     )
 
 
-def get_proposal_prompt(state, slot_id: int, team_size: int) -> str:
+def get_proposal_prompt(state, slot_id: int, team_size: int, retry_hint: str = None) -> str:
     role = state.slot_to_role[slot_id]
     priority = _dynamic_priority_block(role, state)
     context = _build_game_context(state, slot_id)
@@ -658,7 +624,7 @@ def get_proposal_prompt(state, slot_id: int, team_size: int) -> str:
         lines.append("Putting both yourself and your evil ally on a small team risks a double fail: 2 fails on a 2-person team exposes both of you as evil.")
 
     team_size_hint = f"exactly {team_size} player name(s) as strings"
-    return (
+    user = (
         f"{priority}\n\n{context}{lessons}"
         + "\n".join(lines) + "\n"
         f"Refer to yourself as 'I'/'me'. Your public speech must name the same players as proposed_team.\n"
@@ -666,6 +632,9 @@ def get_proposal_prompt(state, slot_id: int, team_size: int) -> str:
         f'"speech": "your public announcement naming the same players as proposed_team", '
         f'"private_note": "your reasoning"}}\n'
     )
+    if retry_hint:
+        user += f"\nPARSE ERROR — previous response was malformed: {retry_hint}\n"
+    return user
 
 def get_vote_prompt(state, slot_id: int, proposer_slot: int, proposed_team: List[int]) -> str:
     role = state.slot_to_role[slot_id]

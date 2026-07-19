@@ -3,7 +3,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+# Up to three NVIDIA API keys. The runtime rotator tries them in order;
+# when a call hits a retriable error (rate limit / 5xx / connection / timeout),
+# it advances to the next key and loops back to the first when all three fail.
+NVIDIA_API_KEY1 = os.getenv("NVIDIA_API_KEY1", "")
+NVIDIA_API_KEY2 = os.getenv("NVIDIA_API_KEY2", "")
+NVIDIA_API_KEY3 = os.getenv("NVIDIA_API_KEY3", "")
+
+# Backward-compat: if someone still sets the legacy single key, treat it as key1.
+_LEGACY = os.getenv("NVIDIA_API_KEY", "")
+if not NVIDIA_API_KEY1 and _LEGACY:
+    NVIDIA_API_KEY1 = _LEGACY
+
+NVIDIA_API_KEYS = [k for k in (NVIDIA_API_KEY1, NVIDIA_API_KEY2, NVIDIA_API_KEY3) if k]
+# Primary key used for the very first attempt; mirrors key1 in the rotator.
+NVIDIA_API_KEY = NVIDIA_API_KEYS[0] if NVIDIA_API_KEYS else ""
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 MODEL_NAME = os.getenv("MODEL_NAME", "meta/llama-3.1-70b-instruct")
 

@@ -20,12 +20,6 @@ GOOD_ROLES = {"Merlin", "Percival", "LoyalServant"}
 EVIL_ROLES = {"Assassin", "Morgana"}
 
 
-def _validate_lesson_format(lesson: str, phase: str) -> tuple[bool, str]:
-    """Thin wrapper — kept as a private name inside reflector.py for clarity, but
-    delegates to the canonical validate_lesson in memory.manager."""
-    return validate_lesson(lesson, phase)
-
-
 def _sanitize_names(text: str, names: list) -> str:
     result = text
     for name in names:
@@ -318,114 +312,99 @@ ASSASSIN:
     return system, user, all_names
 
 def _build_evil_coord_prompt(state: GameState) -> tuple:
-    all_names = list(state.slot_to_name.values())
-    phases = EVIL_COORD_PHASES
-    phase_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
-    assassin_slot = state.role_to_slot.get("Assassin")
-    morgana_slot = state.role_to_slot.get("Morgana")
+    return _build_coord_prompt(state, kind="evil")
 
-    vote_log = "VOTE HISTORY (A/M = Assassin/Morgana):\n" + "\n".join(
-        f"  Q{v.quest_num}P{v.proposal_num}: {_n(state, v.proposer_slot)} → {[_n(state, s) for s in v.proposed_team]} "
-        f"[{v.result}] | A: {v.votes.get(assassin_slot)} | M: {v.votes.get(morgana_slot)}"
+
+def _build_coord_prompt(state: GameState, kind: str) -> tuple:
+    """Single builder shared by evil and good coordination reflection prompts."""
+    all_names = list(state.slot_to_name.values())
+    phases = EVIL_COORD_PHASES if kind == "evil" else GOOD_COORD_PHASES
+    phase_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
+
+    if kind == "evil":
+        role_tags = "A/M = Assassin/Morgana"
+        faction_label = "EVIL TEAM (Assassin + Morgana)"
+        slot_a = state.role_to_slot.get("Assassin")
+        slot_m = state.role_to_slot.get("Morgana")
+        evil_slots = {slot_a, slot_m} - {None}
+        frame = (
+            "Evil coordination lessons cover: signaling alignment without exposing both, "
+            "vote coordination (split tickets, double-downs), proposal influence, fail discipline, "
+            "and Merlin targeting the assassin phase."
+        )
+        example_pos = (
+            '\n  POSITIVE EXAMPLE (vote): "When Assassin and Morgana both APPROVE a clean team at 0-0, split the next vote -- one REJECTs to test if good follows -- signaling confidence without lockstep. (observed on WIN)"'
+            '\n  POSITIVE EXAMPLE (mission): "When both evil are on a 2-person team, EXACTLY ONE plays FAIL -- double-fail exposes both mathematically. (observed on LOSS)"'
+        )
+        vote_tags = lambda v: f"A: {v.votes.get(slot_a)} | M: {v.votes.get(slot_m)}"
+        mission_header = "MISSIONS (evil on team marked *):"
+        def mission_mark(m):
+            names = [_n(state, s) + ('*' if s in evil_slots else '') for s in m.team]
+            return f"  Q{m.quest_num}: {names} → {m.result} ({m.num_fails} fail(s))"
+    else:
+        role_tags = "M/P/L = Merlin/Percival/LoyalServant"
+        faction_label = "GOOD TEAM (Merlin, Percival, LoyalServant)"
+        slot_m = state.role_to_slot.get("Merlin")
+        slot_p = state.role_to_slot.get("Percival")
+        loyal_slots = [s for s, r in state.slot_to_role.items() if r == "LoyalServant"]
+        frame = (
+            "Good coordination lessons cover: trusted-cluster formation, Merlin protection via Percival, "
+            "vote alignment without exposing Merlin, clean proposal support, fail-pattern reading, "
+            "and consensus maintenance under pressure."
+        )
+        example_pos = (
+            '\n  POSITIVE EXAMPLE (vote): "When score is 2-2 and a proposed team has no prior-fail players, Percival APPROVEs and signals Merlin to do the same -- clean teams must be passed at match point. (observed on WIN)"'
+            '\n  POSITIVE EXAMPLE (proposal): "When Merlin is leader at 1-1, propose the 2 players you trust most -- Percival reads this as a trust signal and aligns. (observed on WIN)"'
+        )
+        vote_tags = lambda v: f"M: {v.votes.get(slot_m)} | P: {v.votes.get(slot_p)} | L: {[v.votes.get(s) for s in loyal_slots]}"
+        mission_header = "MISSIONS:"
+        def mission_mark(m):
+            return f"  Q{m.quest_num}: {[_n(state, s) for s in m.team]} → {m.result} ({m.num_fails} fail(s))"
+
+    vote_log = "VOTE HISTORY (" + role_tags + "):\n" + "\n".join(
+        f"  Q{v.quest_num}P{v.proposal_num}: {_n(state, v.proposer_slot)} → "
+        f"{[_n(state, s) for s in v.proposed_team]} [{v.result}] | {vote_tags(v)}"
         for v in state.vote_history
     )
-    mission_log = "MISSIONS (evil on team marked *):\n" + "\n".join(
-        f"  Q{m.quest_num}: {[_n(state,s)+('*' if s in {assassin_slot,morgana_slot} else '') for s in m.team]} "
-        f"→ {m.result} ({m.num_fails} fail(s))"
-        for m in state.mission_history
-    )
-    discussion_log = "DISCUSSION:\n" + "\n".join(
+    if state.mission_history:
+        mission_log = mission_header + "\n" + "\n".join(mission_mark(m) for m in state.mission_history)
+    else:
+        mission_log = mission_header + "\n  (none)"
+    discussion_log = "\n".join(
         f"  Q{d.quest_num} {_n(state, d.slot_id)}: \"{d.statement}\""
         for d in state.discussion_log
     ) or "None."
 
     system = (
-        f"Extract coordination lessons for the EVIL TEAM (Assassin + Morgana). Outcome: {state.outcome}.\n"
+        f"Extract coordination lessons for the {faction_label}. Outcome: {state.outcome}.\n"
         f"Phases: {phases}\n"
         f"Phase definitions:\n{phase_desc}\n"
         f"{_build_quality_bar()}\n\n"
-        "Evil coordination lessons cover: signaling alignment without exposing both, "
-        "vote coordination (split tickets, double-downs), proposal influence, fail discipline, "
-        "and Merlin targeting the assassin phase.\n\n"
-        "POSITIVE EXAMPLE (vote phase):\n"
-        "  'When Assassin and Morgana both APPROVE a clean team at 0-0, split the next vote -- "
-        "one REJECTs to test if good follows -- signaling confidence without lockstep. (observed on WIN)'\n"
-        "POSITIVE EXAMPLE (mission phase):\n"
-        "  'When both evil are on a 2-person team, EXACTLY ONE plays FAIL -- double-fail exposes both mathematically. (observed on LOSS)'\n"
-        'OUTPUT JSON SCHEMA:\n'
+        f"{frame}\n\n"
+        f"{example_pos}\n"
+        f'OUTPUT JSON SCHEMA:\n'
         '{ "add_tentative": [ {"phase": "vote", "lesson": "...", "grounding": "..."} ],\n'
         '  "confirm_active": [ {"phase": "...", "keyword": "..."} ],\n'
         '  "flag_deprecated": [ {"phase": "...", "keyword": "...", "reason": "..."} ] }'
     )
 
     user = (
-        f"Game {state.game_id:03d} | Evil outcome: {state.outcome}\n\n"
+        f"Game {state.game_id:03d} | {kind.capitalize()} outcome: {state.outcome}\n\n"
         f"{vote_log}\n\n"
         f"{mission_log}\n\n"
-        f"{discussion_log}\n\n"
-        "Extract 0-1 lesson PER PHASE where evil coordination was acted upon or revealed. "
+        f"DISCUSSION:\n{discussion_log}\n\n"
+        f"Extract 0-1 lesson PER PHASE where {kind} coordination was acted upon or revealed. "
         "Each lesson: trigger + action + reason + outcome tag. ≤35 words. "
         "Private 'grounding' field names the specific moment.\n"
-        'Return ONLY valid JSON starting with {"add_tentative": ['
+        f'Return ONLY valid JSON starting with {{"add_tentative": ['
     )
 
     return system, user, all_names
+
 
 def _build_good_coord_prompt(state: GameState) -> tuple:
-    all_names = list(state.slot_to_name.values())
-    phases = GOOD_COORD_PHASES
-    phase_desc = "\n".join(f"  {p}: {PHASE_DESCRIPTIONS[p]}" for p in phases)
-    merlin_slot = state.role_to_slot.get("Merlin")
-    percival_slot = state.role_to_slot.get("Percival")
-    loyal_slots = [s for s, r in state.slot_to_role.items() if r == "LoyalServant"]
+    return _build_coord_prompt(state, kind="good")
 
-    vote_log = "VOTE HISTORY (M/P/L = Merlin/Percival/LoyalServant):\n" + "\n".join(
-        f"  Q{v.quest_num}P{v.proposal_num}: {_n(state, v.proposer_slot)} → {[_n(state, s) for s in v.proposed_team]} "
-        f"[{v.result}] | M: {v.votes.get(merlin_slot)} | P: {v.votes.get(percival_slot)} | "
-        f"L: {[v.votes.get(s) for s in loyal_slots]}"
-        for v in state.vote_history
-    )
-    mission_log = "MISSIONS:\n" + "\n".join(
-        f"  Q{m.quest_num}: {[_n(state,s) for s in m.team]} → {m.result} ({m.num_fails} fail(s))"
-        for m in state.mission_history
-    )
-    discussion_log = "DISCUSSION:\n" + "\n".join(
-        f"  Q{d.quest_num} {_n(state, d.slot_id)}: \"{d.statement}\""
-        for d in state.discussion_log
-    ) or "None."
-
-    system = (
-        f"Extract coordination lessons for the GOOD TEAM (Merlin, Percival, LoyalServant). Outcome: {state.outcome}.\n"
-        f"Phases: {phases}\n"
-        f"Phase definitions:\n{phase_desc}\n"
-        f"{_build_quality_bar()}\n\n"
-        "Good coordination lessons cover: trusted cluster formation, Merlin protection via Percival, "
-        "vote alignment without exposing Merlin, clean proposal support, fail-pattern reading, "
-        "and consensus maintenance under pressure.\n\n"
-        "POSITIVE EXAMPLE (vote phase):\n"
-        "  'When score is 2-2 and a proposed team has no prior-fail players, Percival APPROVEs and "
-        "signals Merlin to do the same -- clean teams must be passed at match point. (observed on WIN)'\n"
-        "POSITIVE EXAMPLE (proposal phase):\n"
-        "  'When Merlin is leader at 1-1, propose the 2 players you trust most -- Percival reads this "
-        "as a trust signal and aligns. (observed on WIN)'\n"
-        'OUTPUT JSON SCHEMA:\n'
-        '{ "add_tentative": [ {"phase": "vote", "lesson": "...", "grounding": "..."} ],\n'
-        '  "confirm_active": [ {"phase": "...", "keyword": "..."} ],\n'
-        '  "flag_deprecated": [ {"phase": "...", "keyword": "...", "reason": "..."} ] }'
-    )
-
-    user = (
-        f"Game {state.game_id:03d} | Good outcome: {state.outcome}\n\n"
-        f"{vote_log}\n\n"
-        f"{mission_log}\n\n"
-        f"{discussion_log}\n\n"
-        "Extract 0-1 lesson PER PHASE where good coordination was acted upon or revealed. "
-        "Each lesson: trigger + action + reason + outcome tag. ≤35 words. "
-        "Private 'grounding' field names the specific moment.\n"
-        'Return ONLY valid JSON starting with {"add_tentative": ['
-    )
-
-    return system, user, all_names
 
 def _log_reflection_debug(game_id: int, role: str, delta: dict, applied_counts: dict):
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -519,7 +498,7 @@ def _has_sufficient_lessons(delta: dict) -> bool:
         and item.get("lesson", "").strip()
         and "<" not in item.get("phase", "")
         and "<" not in item.get("lesson", "")
-        and _validate_lesson_format(item["lesson"], item["phase"])[0]
+        and validate_lesson(item["lesson"], item["phase"])[0]
     ]
     return len(valid) >= 1
 
@@ -539,7 +518,7 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
             lesson = item.get("lesson", "").strip()
             if not phase or not lesson or "<" in phase or "<" in lesson:
                 continue
-            is_valid, reason = _validate_lesson_format(lesson, phase)
+            is_valid, reason = validate_lesson(lesson, phase)
             if not is_valid:
                 print(f"    [REFLECTION VALIDATION] Rejected {phase} lesson: {reason} — \"{lesson[:60]}...\"")
                 continue
@@ -571,7 +550,7 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
             lesson = (extra.get("lesson") or extra.get(phase) or "").strip()
             if not lesson or "<" in lesson:
                 continue
-            is_valid, reason = _validate_lesson_format(lesson, phase)
+            is_valid, reason = validate_lesson(lesson, phase)
             if not is_valid:
                 print(f"    [TARGETED RESCUE] Rejected {phase} lesson: {reason}")
                 continue

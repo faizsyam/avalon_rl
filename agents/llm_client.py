@@ -1,10 +1,18 @@
 import json
 import re
 import os
+import threading
 from datetime import datetime
 from typing import Optional, Type, TypeVar, Dict, Any
-from openai import OpenAI
-from config import NVIDIA_API_KEY, NVIDIA_BASE_URL, MODEL_NAME, GAMEPLAY_MAX_TOKENS, REFLECTION_MAX_TOKENS, LOGS_DIR
+from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError, RateLimitError
+from config import (
+    NVIDIA_API_KEYS,
+    NVIDIA_BASE_URL,
+    MODEL_NAME,
+    GAMEPLAY_MAX_TOKENS,
+    REFLECTION_MAX_TOKENS,
+    LOGS_DIR,
+)
 
 try:
     from pydantic import BaseModel, ValidationError
@@ -17,13 +25,76 @@ except ImportError:
 T = TypeVar("T", bound="BaseModel")
 
 
-def _make_client() -> OpenAI:
-    return OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
+_RETRIABLE_EXC = (RateLimitError, APIConnectionError, APITimeoutError)
+
+
+def _is_retriable(exc: Exception) -> bool:
+    """Return True for errors that another key (or another attempt) might recover from."""
+    if isinstance(exc, _RETRIABLE_EXC):
+        return True
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            return True
+        # 408 request timeout, 429 too many requests, 5xx server errors
+        return status == 408 or status == 429 or status >= 500
+    return False
+
+
+class KeyRotator:
+    """Cycles through a pool of NVIDIA API keys.
+
+    `current` yields the active OpenAI client. `rotate()` advances to the next
+    key and returns its client, wrapping back to the first after the last.
+    The rotator is process-wide (one instance per process) so callers share
+    state: when gameplay hits a rate limit on key1, reflection's next call
+    starts on key2 instead of burning key1 again.
+    """
+
+    def __init__(self, keys, base_url, label_prefix="key"):
+        self._keys = list(keys)
+        if not self._keys:
+            raise RuntimeError(
+                "No NVIDIA API keys configured. Set NVIDIA_API_KEY1/2/3 in .env."
+            )
+        self._clients = [OpenAI(api_key=k, base_url=base_url) for k in self._keys]
+        self._index = 0
+        self._lock = threading.Lock()
+        # Stable labels per key for logging ("key1", "key2", ...)
+        self._labels = [f"{label_prefix}{i + 1}" for i in range(len(self._keys))]
+
+    def __len__(self) -> int:
+        return len(self._clients)
+
+    def _label(self, idx: int) -> str:
+        return self._labels[idx]
+
+    def current(self):
+        with self._lock:
+            return self._clients[self._index], self._label(self._index)
+
+    def rotate(self):
+        with self._lock:
+            self._index = (self._index + 1) % len(self._clients)
+            return self._clients[self._index], self._label(self._index)
+
+    def reset(self):
+        with self._lock:
+            self._index = 0
+
+
+# Shared across gameplay + reflection clients so quota pressure on one pool
+# is visible to the other.
+_ROTATOR = KeyRotator(NVIDIA_API_KEYS, NVIDIA_BASE_URL) if NVIDIA_API_KEYS else None
 
 
 def create_llm() -> dict:
+    if _ROTATOR is None:
+        raise RuntimeError(
+            "No NVIDIA API keys configured. Set NVIDIA_API_KEY1/2/3 in .env."
+        )
     return {
-        "client": _make_client(),
+        "rotator": _ROTATOR,
         "model": MODEL_NAME,
         "temperature": 0.85,
         "max_tokens": GAMEPLAY_MAX_TOKENS,
@@ -31,8 +102,12 @@ def create_llm() -> dict:
 
 
 def create_reflection_llm() -> dict:
+    if _ROTATOR is None:
+        raise RuntimeError(
+            "No NVIDIA API keys configured. Set NVIDIA_API_KEY1/2/3 in .env."
+        )
     return {
-        "client": _make_client(),
+        "rotator": _ROTATOR,
         "model": MODEL_NAME,
         "temperature": 0.6,
         "max_tokens": REFLECTION_MAX_TOKENS,
@@ -40,19 +115,53 @@ def create_reflection_llm() -> dict:
 
 
 def _call(llm: dict, messages: list) -> str:
-    try:
-        response = llm["client"].chat.completions.create(
-            model=llm["model"],
-            messages=messages,
-            temperature=llm["temperature"],
-            max_tokens=llm["max_tokens"],
-            extra_body={"chat_template_kwargs": {"enable_thinking": True, "clear_thinking": True}},
-            stream=False
-        )
-        return response.choices[0].message.content or ""
-    except Exception as e:
-        print(f"    [LLM ERROR] {e}")
-        return ""
+    rotator: KeyRotator = llm["rotator"]
+    request_kwargs = dict(
+        model=llm["model"],
+        messages=messages,
+        temperature=llm["temperature"],
+        max_tokens=llm["max_tokens"],
+        extra_body={"chat_template_kwargs": {"enable_thinking": True, "clear_thinking": True}},
+        stream=False,
+    )
+
+    # Two full sweeps across the key pool before giving up on this call.
+    # Each retriable error advances the rotator; the next call resumes where
+    # the previous one left off, and keeps looping around indefinitely.
+    max_attempts = max(1, 2 * len(rotator))
+    last_exc = None
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            client, label = rotator.current()
+        else:
+            client, label = rotator.rotate()
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            last_exc = e
+            if not _is_retriable(e):
+                print(f"    [LLM ERROR] [{label}] non-retriable: {e}")
+                return ""
+            next_label = (
+                rotator._labels[(rotator._index + 1) % len(rotator)]
+                if attempt + 1 < max_attempts
+                else None
+            )
+            err_name = type(e).__name__
+            if next_label is not None:
+                print(
+                    f"    [LLM RETRY] [{label}] {err_name}: {e} -> rotating to {next_label}"
+                )
+            else:
+                print(
+                    f"    [LLM RETRY] [{label}] {err_name}: {e} -> wrapping back to first key"
+                )
+
+    print(
+        f"    [LLM ERROR] Exhausted {max_attempts} attempts across {len(rotator)} keys: {last_exc}"
+    )
+    return ""
 
 
 def _extract_json(text: str) -> str:
