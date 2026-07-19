@@ -82,6 +82,50 @@ class GameEngine:
             state.agent_notes[slot_id] = []
         state.agent_notes[slot_id].append(note.strip())
 
+    def _record_phase_memory(self, state: GameState, slot_id: int, phase: str, text: str, quest_num: int = None):
+        """Slim `text` to one tight line and append to per-agent phase memory.
+
+        The slim rule: first non-empty line, hard-capped at 140 chars (truncated
+        with ellipsis on overflow). `quest_num` is prepended as a `[Q{n} {phase}]`
+        tag so the agent sees the cross-quest timeline at a glance.
+        """
+        from agents.prompts import PHASE_MEMORY_LINE_CAP
+        if not text or not text.strip():
+            return
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        if not first_line:
+            return
+        if len(first_line) > PHASE_MEMORY_LINE_CAP:
+            first_line = first_line[: PHASE_MEMORY_LINE_CAP - 1].rstrip() + "…"
+        qn = quest_num if quest_num is not None else state.quest_num
+        bullet = f"[Q{qn} {phase}] {first_line}"
+        per_phase = state.agent_phase_memory.setdefault(slot_id, {}).setdefault(phase, [])
+        per_phase.append(bullet)
+
+    def _prune_phase_memory(self, state: GameState, slot_id: int):
+        """Cap each phase's bullet list to the most recent entries."""
+        from agents.prompts import PHASE_MEMORY_PER_PHASE_CAP
+        per_phase = state.agent_phase_memory.get(slot_id)
+        if not per_phase:
+            return
+        for phase, lst in list(per_phase.items()):
+            if len(lst) > PHASE_MEMORY_PER_PHASE_CAP:
+                per_phase[phase] = lst[-PHASE_MEMORY_PER_PHASE_CAP:]
+
+    def _refresh_running_digest(self, state: GameState, slots=None):
+        """Recompute the deterministic game-state digest for one or all agents.
+
+        Cheap (no LLM): walks state.mission_history / state.vote_history /
+        state.discussion_log to produce a role-templated snapshot. Called
+        after every mission conclusion and vote outcome so reads always
+        reflect the latest evidence. Same call works mid-game (e.g., between
+        proposals) so the in-prompt digest never goes stale."""
+        from agents.prompts import build_running_digest
+        targets = slots if slots is not None else list(range(5))
+        for s in targets:
+            digest = build_running_digest(state, s)
+            state.agent_running_digest[s] = digest
+
     def _broadcast_event_note(self, state: GameState, note: str, slots: List[int] = None):
         """Write a factual game event note to all agents (or a subset)."""
         targets = slots if slots is not None else list(range(5))
@@ -165,6 +209,9 @@ class GameEngine:
                 )
             state.log_lines.append(f"Vote result: {result} ({approve_count}/5 approve)")
             print_vote_result(result, approve_count)
+            # Cheap deterministic rebuild — voting history shifted, so per-player
+            # voting patterns (used in the running digest) change.
+            self._refresh_running_digest(state)
 
             # Broadcast factual vote outcome as an event note to all agents
             approvers = [s for s, v in votes.items() if v == "APPROVE"]
@@ -238,6 +285,7 @@ class GameEngine:
 
             if note:
                 self._append_note(state, slot, f"[Q{state.quest_num} Discussion] {note}")
+                self._record_phase_memory(state, slot, "discussion", note, quest_num=state.quest_num)
             print_statement(slot, role, statement, state.slot_to_name)
 
     def _get_proposal(self, state: GameState, team_size: int) -> List[int]:
@@ -295,6 +343,7 @@ class GameEngine:
                 state.log_lines.append(f'  {leader_name} ({role}) proposes {team_names}: "{speech}"')
                 if note:
                     self._append_note(state, leader, f"[Q{state.quest_num} Proposal] {note}")
+                    self._record_phase_memory(state, leader, "proposal", note, quest_num=state.quest_num)
                 print_proposal(leader, role, valid, speech, state.slot_to_name)
                 return valid
 
@@ -363,6 +412,7 @@ class GameEngine:
             note = result.get("private_note", "") if isinstance(result, dict) else ""
             if note:
                 self._append_note(state, slot, f"[Q{state.quest_num} Vote] {note}")
+                self._record_phase_memory(state, slot, "vote", note, quest_num=state.quest_num)
             print_vote(slot, role, vote, speeches[slot], state.slot_to_name)
         return votes, speeches
 
@@ -398,6 +448,7 @@ class GameEngine:
             state.log_lines.append(f'  {name}: "{statement}"')
             if note:
                 self._append_note(state, slot, f"[Q{state.quest_num} Rejection] {note}")
+                self._record_phase_memory(state, slot, "discussion", note, quest_num=state.quest_num)
             print_statement(slot, role, statement, state.slot_to_name)
 
     def _run_mission(self, state: GameState, team: List[int]):
@@ -412,6 +463,7 @@ class GameEngine:
                 team_names = [state.slot_to_name[s] for s in team]
                 internal = f"Good always plays SUCCESS. Team: {team_names}"
                 self._append_note(state, slot, f"[Q{state.quest_num} Mission] {internal}")
+                self._record_phase_memory(state, slot, "mission", f"Good — no choice: SUCCESS on team {team_names}", quest_num=state.quest_num)
                 cards.append(card)
                 state.log_lines.append(f'  [PRIVATE] Slot {slot} ({role}) played {card}: "{internal}"')
                 print_mission_private(slot, role, card, internal, state.slot_to_name)
@@ -443,6 +495,8 @@ class GameEngine:
                 cards.append(card)
                 state.log_lines.append(f'  [PRIVATE] Slot {slot} ({role}) played {card}: "{internal}"')
                 print_mission_private(slot, role, card, internal, state.slot_to_name)
+                # Evil only — their interpretation is the cross-quest memory that matters.
+                self._record_phase_memory(state, slot, "mission", internal, quest_num=state.quest_num)
 
         num_fails = cards.count("FAIL")
         mission_result = "FAIL" if num_fails > 0 else "SUCCESS"
@@ -463,6 +517,14 @@ class GameEngine:
             state,
             f"[EVENT] Q{state.quest_num} MISSION: team={team_names} → {mission_result} ({num_fails} fail(s)). Score G{state.good_wins}/E{state.evil_wins}"
         )
+
+        # Mission outcome is the single highest-information transition in the
+        # game: it can mathematically confirm new evil players and changes who
+        # is suspicious. Refresh every agent's digest deterministically here
+        # so the next phase prompt reads the new public evidence.
+        for s in range(5):
+            self._prune_phase_memory(state, s)
+        self._refresh_running_digest(state)
 
     def _run_assassin_phase(self, state: GameState):
         assassin_slot = state.role_to_slot["Assassin"]

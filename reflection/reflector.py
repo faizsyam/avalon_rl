@@ -12,6 +12,7 @@ from memory.manager import (
     apply_good_coord_delta,
     get_lesson_stats,
     validate_lesson,
+    repair_lesson,
 )
 
 MAX_REFLECTION_RETRIES = 2
@@ -304,8 +305,12 @@ ASSASSIN:
         f"{targeted_questions}\n\n"
         f"{few_shots}\n"
         "Extract 0-1 lesson PER PHASE you acted in (skip phases where this game yielded no insight).\n"
-        "Each lesson = trigger + action + causal reason + outcome tag. ≤35 words. "
-        "Private 'grounding' field names the specific turn/score/play that anchors it.\n"
+        "LESSON FORMAT — STRICT, MACHINE-VALIDATED:\n"
+        '  • Each "lesson" string MUST start with "When " (capital W).\n'
+        '  • MUST contain the literal substring " because " exactly once, between the action and the outcome tag.\n'
+        '  • MUST end with exactly one of: " (observed on WIN)" or " (observed on LOSS)" — use WIN if your faction won, LOSS otherwise.\n'
+        "  • Total word count MUST be ≤ 35 (count tokens separated by spaces).\n"
+        "  • Optional private \"grounding\" field names the specific turn/score/play that anchors it (not persisted).\n"
         'Return ONLY valid JSON starting with {"add_tentative": ['
     )
 
@@ -393,9 +398,13 @@ def _build_coord_prompt(state: GameState, kind: str) -> tuple:
         f"{vote_log}\n\n"
         f"{mission_log}\n\n"
         f"DISCUSSION:\n{discussion_log}\n\n"
-        f"Extract 0-1 lesson PER PHASE where {kind} coordination was acted upon or revealed. "
-        "Each lesson: trigger + action + reason + outcome tag. ≤35 words. "
-        "Private 'grounding' field names the specific moment.\n"
+        f"Extract 0-1 lesson PER PHASE where {kind} coordination was acted upon or revealed.\n"
+        "LESSON FORMAT — STRICT, MACHINE-VALIDATED:\n"
+        '  • Each "lesson" string MUST start with "When ".\n'
+        '  • MUST contain the literal substring " because " exactly once.\n'
+        '  • MUST end with exactly one of: " (observed on WIN)" or " (observed on LOSS)".\n'
+        "  • Total word count MUST be ≤ 35.\n"
+        '  • Optional private "grounding" field names the specific moment (not persisted).\n'
         f'Return ONLY valid JSON starting with {{"add_tentative": ['
     )
 
@@ -502,28 +511,45 @@ def _has_sufficient_lessons(delta: dict) -> bool:
     ]
     return len(valid) >= 1
 
-def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id: int, phases: list) -> dict:
+def _validate_and_repair_tentative(items, faction_won=None):
+    """Validate each tentative lesson and attempt deterministic repair on
+    invalid ones (truncate to ≤35 words, append a missing outcome tag)
+    before final reject.
+
+    Lessons still failing validation after repair are dropped — typically
+    because the model omitted ' because ' or the 'When ' trigger and we
+    refuse to fabricate that content. The `faction_won` flag, when
+    provided, lets us auto-attach the outcome tag (it is observable from
+    the game state, not invented)."""
+    ok = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        phase = (item.get("phase") or "").strip()
+        lesson = (item.get("lesson") or "").strip()
+        if not phase or not lesson:
+            continue
+        if "<" in phase or "<" in lesson:
+            continue
+        is_valid, reason = validate_lesson(lesson, phase)
+        if not is_valid:
+            repaired = repair_lesson(lesson, phase, faction_won=faction_won)
+            if repaired and validate_lesson(repaired, phase)[0]:
+                print(f"    [REFLECTION REPAIR] {phase}: {reason} → repaired")
+                lesson = repaired
+            else:
+                print(f"    [REFLECTION VALIDATION] Rejected {phase} lesson: {reason} — \"{lesson[:60]}...\"")
+                continue
+        ok.append({"phase": phase, "lesson": lesson, "grounding": item.get("grounding", "")})
+    return ok
+
+
+def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id: int, phases: list, faction_won) -> dict:
     """Reflection call with format-aware retries. Two configurations:
        1) primary: prefilled JSON with per-phase lesson list;
        2) on validation fail, per-phase targeted retry for any missing/empty phases.
     Returns the best valid dict (with add_tentative populated), or {} on failure."""
     PREFILL = '{"add_tentative": ['
-
-    def _validate_tentative(items):
-        ok = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            phase = item.get("phase", "").strip()
-            lesson = item.get("lesson", "").strip()
-            if not phase or not lesson or "<" in phase or "<" in lesson:
-                continue
-            is_valid, reason = validate_lesson(lesson, phase)
-            if not is_valid:
-                print(f"    [REFLECTION VALIDATION] Rejected {phase} lesson: {reason} — \"{lesson[:60]}...\"")
-                continue
-            ok.append({"phase": phase, "lesson": lesson, "grounding": item.get("grounding", "")})
-        return ok
 
     def _backfill_missing(delta):
         """For any phase the LLM didn't fill, ask for it directly."""
@@ -533,13 +559,21 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
             if phase in covered:
                 continue
             targeted_user = (
-                f"{user}\n\nWrite ONLY the lesson for phase '{phase}'. "
+                f"{user}\n\nWrite ONLY the lesson for phase '{phase}'.\n"
+                f"Hard format requirements:\n"
+                f'  • Begin the lesson text with "When ".\n'
+                f'  • Include " because " exactly once between the action and the outcome tag.\n'
+                f'  • End the lesson with EXACTLY one of: " (observed on WIN)" or " (observed on LOSS)".\n'
+                f'  • Total length MUST be ≤ 35 words.\n'
                 f'Return ONLY: {{"phase": "{phase}", "lesson": "When X, do Y because Z. (observed on WIN or LOSS)"}}'
             )
             targeted_system = (
-                f"You are writing a single lesson for the '{phase}' phase. "
-                f"Definition: {PHASE_DESCRIPTIONS.get(phase, phase)}. "
-                f"Role: {role}. Max 35 words. Format: When X, do Y because Z. (observed on WIN|LOSS)"
+                f"You are writing a single lesson for the '{phase}' phase of The Resistance: Avalon. "
+                f"Phase definition: {PHASE_DESCRIPTIONS.get(phase, phase)}. "
+                f"Role: {role}. "
+                f"Strict output format: 'When X, do Y because Z. (observed on WIN|LOSS)' — ≤35 words. "
+                f"You MUST include the literal substring ' because ' exactly once and MUST end with exactly one of "
+                f"' (observed on WIN)' or ' (observed on LOSS)'."
             )
             extra = call_llm_json(
                 llm, targeted_system, targeted_user,
@@ -552,8 +586,13 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
                 continue
             is_valid, reason = validate_lesson(lesson, phase)
             if not is_valid:
-                print(f"    [TARGETED RESCUE] Rejected {phase} lesson: {reason}")
-                continue
+                repaired = repair_lesson(lesson, phase, faction_won=faction_won)
+                if repaired and validate_lesson(repaired, phase)[0]:
+                    print(f"    [TARGETED REPAIR] {phase}: {reason} → repaired")
+                    lesson = repaired
+                else:
+                    print(f"    [TARGETED RESCUE] Rejected {phase} lesson: {reason}")
+                    continue
             backfilled.append({"phase": phase, "lesson": lesson})
         delta["add_tentative"] = backfilled
 
@@ -571,7 +610,7 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
         if not isinstance(delta, dict):
             continue
         delta = _rescue_toplevel_lesson(delta)
-        delta["add_tentative"] = _validate_tentative(delta.get("add_tentative", []))
+        delta["add_tentative"] = _validate_and_repair_tentative(delta.get("add_tentative", []), faction_won=faction_won)
         _backfill_missing(delta)
 
         if _has_sufficient_lessons(delta):
@@ -583,11 +622,16 @@ def _call_reflection_with_retry(llm, system: str, user: str, role: str, game_id:
 def run_reflection(state: GameState, llm) -> dict:
     counts = {}
 
+    evil_won = (state.outcome == "EVIL_WINS")
+    good_won = (state.outcome == "GOOD_WINS")
+
     for role in ALL_ROLES:
         slot_id = state.role_to_slot[role]
         system, user, names = _build_reflection_prompt(role, state, slot_id)
         phases = ROLES_CONFIG[role].get("phases", ["discussion", "proposal", "vote", "mission"])
-        delta = _call_reflection_with_retry(llm, system, user, role, state.game_id, phases)
+        faction = ROLES_CONFIG[role]["faction"]
+        faction_won = (faction == "evil" and evil_won) or (faction == "good" and good_won)
+        delta = _call_reflection_with_retry(llm, system, user, role, state.game_id, phases, faction_won)
 
         if isinstance(delta, dict):
             delta = _sanitize_delta(delta, names)
@@ -619,7 +663,13 @@ def run_reflection(state: GameState, llm) -> dict:
     coord_delta = coord_delta if isinstance(coord_delta, dict) else {}
     coord_delta = _rescue_toplevel_lesson(coord_delta)
     coord_delta = _sanitize_delta(coord_delta, names)
-    _log_coord_reflection_debug("evil_coord", state.game_id, coord_delta)
+    if coord_delta.get("add_tentative"):
+        coord_delta["add_tentative"] = _validate_and_repair_tentative(
+            coord_delta.get("add_tentative", []), faction_won=evil_won,
+        )
+        coord_delta.setdefault("confirm_active", [])
+        coord_delta.setdefault("flag_deprecated", [])
+        _log_coord_reflection_debug("evil_coord", state.game_id, coord_delta)
     if coord_delta.get("add_tentative"):
         apply_evil_coord_delta(coord_delta, state.game_id)
 
@@ -629,7 +679,13 @@ def run_reflection(state: GameState, llm) -> dict:
     good_coord_delta = good_coord_delta if isinstance(good_coord_delta, dict) else {}
     good_coord_delta = _rescue_toplevel_lesson(good_coord_delta)
     good_coord_delta = _sanitize_delta(good_coord_delta, names)
-    _log_coord_reflection_debug("good_coord", state.game_id, good_coord_delta)
+    if good_coord_delta.get("add_tentative"):
+        good_coord_delta["add_tentative"] = _validate_and_repair_tentative(
+            good_coord_delta.get("add_tentative", []), faction_won=good_won,
+        )
+        good_coord_delta.setdefault("confirm_active", [])
+        good_coord_delta.setdefault("flag_deprecated", [])
+        _log_coord_reflection_debug("good_coord", state.game_id, good_coord_delta)
     if good_coord_delta.get("add_tentative"):
         apply_good_coord_delta(good_coord_delta, state.game_id)
 

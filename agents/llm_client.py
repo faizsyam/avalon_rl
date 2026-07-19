@@ -13,6 +13,8 @@ from config import (
     REFLECTION_MAX_TOKENS,
     LOGS_DIR,
 )
+from agents.json_repair import extract_json as _extract_json
+from agents.json_repair import diagnostic_for_unparseable as _diagnostic_for_unparseable
 
 try:
     from pydantic import BaseModel, ValidationError
@@ -164,45 +166,14 @@ def _call(llm: dict, messages: list) -> str:
     return ""
 
 
-def _extract_json(text: str) -> str:
-    """Extract first valid JSON object from text, handling markdown fences."""
-    if not text:
-        return ""
-    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
-    depth = 0
-    in_string = False
-    escape = False
-    start = -1
-    for i, ch in enumerate(text):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"' and not escape:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                return text[start:i+1]
-    return ""
+# Adapter that re-exports json_repair.extract_json under the historical name
+# used elsewhere in this file. `_extract_json` returns a dict or None.
+__all__ = ["call_llm_json", "call_llm_json_prefill", "log_llm_call", "_extract_json"]
 
 
-def _parse_json_strict(text: str) -> Optional[dict]:
-    """Parse JSON strictly, return dict or None."""
-    try:
-        result = json.loads(text)
-        return result if isinstance(result, dict) else None
-    except json.JSONDecodeError:
-        return None
+def _try_parse_dict(value: Any) -> Optional[dict]:
+    """Coerce arbitrary JSON-decoded output to a dict (lists, scalars rejected)."""
+    return value if isinstance(value, dict) else None
 
 
 def _validate_output(output: dict, schema: Optional[Type[T]] = None) -> bool:
@@ -226,25 +197,39 @@ def _format_validation_error(e: ValidationError) -> str:
 
 
 _JSON_SUFFIX = (
-    "\n\nYour entire response must be a single valid JSON object. "
-    "No prose before or after. No markdown fences. "
-    "Do NOT write any analysis or reasoning outside the JSON. "
-    "All thoughts belong inside JSON fields (e.g. private_note, reasoning, internal_note)."
+    "\n\nOUTPUT CONTRACT — read carefully:\n"
+    "- Your entire reply must be ONE JSON object. Nothing else.\n"
+    "- The very first character of your reply must be '{'. The very last must be '}'.\n"
+    "- No prose, no greetings, no analysis, no <think> blocks, no markdown fences "
+    "(```), no trailing prose after the closing brace.\n"
+    "- All your reasoning goes INSIDE the JSON fields (private_note, internal_note, reasoning).\n"
+    "- Use only standard ASCII double-quotes for JSON strings. No smart quotes.\n"
+    "- Escape any internal quotes with \\\". Escape any literal newline as \\n.\n"
+    "- Do NOT add fields not in the schema. Do NOT omit required fields."
 )
 
 _JSON_SYSTEM_ADDON = (
-    "\n\n=== RESPONSE FORMAT (NON-NEGOTIABLE) ===\n"
-    "Your ENTIRE response must be a single valid JSON object.\n"
-    "Do NOT write any text, reasoning, or analysis outside the JSON object.\n"
-    "Do NOT use markdown fences. Start your response with '{' and end with '}'.\n"
-    "Put all your thinking inside the appropriate JSON fields "
-    "(private_note, internal_note, reasoning, etc.)."
+    "\n\n=== OUTPUT FORMAT (NON-NEGOTIABLE) ===\n"
+    "Respond with EXACTLY ONE valid JSON object and nothing else.\n"
+    "Rules:\n"
+    "  1. First character = '{', last character = '}'.\n"
+    "  2. NO prose before the '{' or after the '}'. No greetings, no sign-offs.\n"
+    "  3. NO markdown code fences (```). NO <think>...</think> blocks.\n"
+    "  4. NO analysis or reasoning outside JSON fields — internal thinking\n"
+    "     belongs in private_note / internal_note / reasoning fields.\n"
+    "  5. Use straight ASCII double quotes only. No smart quotes.\n"
+    "  6. Escape inner quotes with \\\" and inner newlines as \\n.\n"
+    "  7. Include every required field shown in the user prompt's JSON template.\n"
+    "Failure to comply will be discarded and retried — replies cost the table time."
 )
 
 _FORMATTER_SYSTEM = (
-    "You are a JSON repair assistant. You receive a malformed JSON attempt and must "
-    "output ONLY a corrected, valid JSON object matching the implied schema. "
-    "No explanations. No markdown. Start with '{' and end with '}'."
+    "You are a strict JSON formatter. The previous reply failed JSON validation.\n"
+    "Return ONLY the corrected JSON object, matching the user prompt's template.\n"
+    "Hard rules:\n"
+    "  - First character = '{', last character = '}'. No fences. No prose.\n"
+    "  - Straight double quotes only. Escape inner newlines as \\n.\n"
+    "  - Output the JSON, period."
 )
 
 
@@ -256,7 +241,12 @@ def call_llm_json(
     schema: Optional[Type[T]] = None,
     max_retries: int = 2
 ) -> dict:
-    """Call LLM with JSON-enforced output. Validates against schema if provided."""
+    """Call LLM with JSON-enforced output. Validates against schema if provided.
+
+    Uses a repair-tolerant parser (`agents.json_repair`) before declaring a JSON
+    failure, so think-block leakage, smart quotes, stray fences, trailing
+    commas, etc. are silently normalized on attempt 1.
+    """
     augmented_system = system + _JSON_SYSTEM_ADDON
     augmented_user = user + _JSON_SUFFIX
 
@@ -274,11 +264,7 @@ def call_llm_json(
         if not text:
             continue
 
-        json_str = _extract_json(text)
-        if not json_str:
-            continue
-
-        result = _parse_json_strict(json_str)
+        result = _try_parse_dict(_extract_json(text))
         if result and _validate_output(result, schema):
             return result
 
@@ -313,13 +299,17 @@ def call_llm_json(
                 {"role": "assistant", "content": "{"},
             ]
 
-    # Final fallback: return empty dict
+    # Final fallback: append a *full diagnostic* to warns.txt so future
+    # parse failures can be diagnosed without rerunning the experiment.
     final_label_str = f" for {call_label}" if call_label else ""
     retry_warn = f"[WARN] All retries failed{final_label_str} — using empty result"
     print(f"    {retry_warn}")
-    if os.path.exists(log_path):
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{retry_warn}\nlast_response: {last_text}\n")
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_path = os.path.join(LOGS_DIR, "warns.txt")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"{retry_warn}\n")
+        f.write(_diagnostic_for_unparseable(last_text or "") + "\n")
+        f.write("---\n")
     return {}
 
 
@@ -331,7 +321,9 @@ def call_llm_json_prefill(
     call_label: str = "",
     schema: Optional[Type[T]] = None
 ) -> dict:
-    """Like call_llm_json but with a custom assistant prefill to force output structure."""
+    """Like `call_llm_json` but with a custom assistant prefill to force output structure.
+    Falls back to repair-tolerant parsing before declaring a JSON failure, and
+    retries once with the strict formatter system prompt if that fails too."""
     augmented_system = system + _JSON_SYSTEM_ADDON
     augmented_user = user + _JSON_SUFFIX
 
@@ -343,13 +335,12 @@ def call_llm_json_prefill(
 
     text = _call(llm, messages)
     # Strip the prefill from the response if model echoes it back
-    if text.startswith(prefill[1:]):
+    if prefill and text.startswith(prefill[1:]):
         text = text[len(prefill) - 1:]
-    json_str = _extract_json(text) if text else ""
-    if json_str:
-        result = _parse_json_strict(json_str)
-        if result and _validate_output(result, schema):
-            return result
+
+    result = _try_parse_dict(_extract_json(text)) if text else None
+    if result and _validate_output(result, schema):
+        return result
 
     label_str = f" for {call_label}" if call_label else ""
     warn = f"[WARN] Invalid JSON prefill{label_str} — retrying with formatter"
@@ -362,6 +353,23 @@ def call_llm_json_prefill(
         f.write(f"Warning    : {warn}\n")
         f.write(f"call_label : {call_label}\n")
         f.write(f"response   : {text}\n")
+
+    # One formatter retry — same pattern as `call_llm_json` but bounded to one shot.
+    try:
+        messages = [
+            {"role": "system", "content": _FORMATTER_SYSTEM},
+            {"role": "user", "content": augmented_user},
+            {"role": "assistant", "content": prefill or "{"},
+        ]
+        text = _call(llm, messages)
+        if prefill and text.startswith(prefill[1:]):
+            text = text[len(prefill) - 1:]
+        result = _try_parse_dict(_extract_json(text)) if text else None
+        if result and _validate_output(result, schema):
+            return result
+    except Exception:
+        pass
+
     return {}
 
 

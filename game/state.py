@@ -51,6 +51,21 @@ class GameState:
     # Key: slot_id (int), Value: list of note strings (one per turn)
     agent_notes: Dict[int, List[str]] = field(default_factory=dict)
 
+    # Per-agent, per-phase TIGHT memory layer used for in-game prompting.
+    # Key: slot_id (int), Value: {phase_name: [bulletin, ...]} where each
+    # bulletin is a single line (<= 140 chars) carrying the agent's own
+    # interpretation. Distinct from `agent_notes` — `agent_notes` keeps the
+    # full verbose log for post-game reflection; `agent_phase_memory` is the
+    # compressed cross-phase memory injected into phase prompts.
+    agent_phase_memory: Dict[int, Dict[str, List[str]]] = field(default_factory=dict)
+
+    # Per-agent deterministic game-state-derived digest. Recomputed by the
+    # engine after every mission and vote outcome (no LLM), so reads always
+    # reflect the latest public evidence. Role-templated on construction:
+    # good agents see evil-suspicion lines, evil agents see Merlin-candidate
+    # lines. Distinct from the LLM-written `agent_phase_memory`.
+    agent_running_digest: Dict[int, List[str]] = field(default_factory=dict)
+
     outcome: Optional[str] = None
     assassin_guess_slot: Optional[int] = None
     assassin_correct: Optional[bool] = None

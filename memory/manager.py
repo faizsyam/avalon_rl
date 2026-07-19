@@ -37,10 +37,24 @@ def validate_lesson(lesson: str, phase: str) -> tuple[bool, str]:
     if not lesson or not lesson.strip():
         return False, "empty lesson"
 
-    stripped = lesson.strip()
-    # Strip leading "- [gXXX] "-style marker so the body can be matched.
-    body = re.sub(r'^-\s*\[(?:DEPRECATED\s+)?g\d+\]\s*', '', stripped)
-    body = re.sub(r'^-\s*', '', body).strip()
+    body = normalize_lesson_body(lesson)
+    return validate_lesson_body(body, phase)
+
+
+def normalize_lesson_body(lesson: str) -> str:
+    """Strip the leading "- [gXXX]" / "- [DEPRECATED gXXX]" prefix and any
+    leading dash so the body can be validated on its own."""
+    s = lesson.strip()
+    s = re.sub(r'^-\s*\[(?:DEPRECATED\s+)?g\d+\]\s*', '', s)
+    s = re.sub(r'^-\s*', '', s).strip()
+    return re.sub(r'\s+', ' ', s)
+
+
+def validate_lesson_body(body: str, phase: str) -> tuple[bool, str]:
+    """Validate an already-normalized lesson body (marker prefix + dash stripped,
+    whitespace collapsed). Returns (is_valid, reason_if_invalid)."""
+    if not body:
+        return False, "empty lesson"
 
     words = body.split()
     if len(words) > 35:
@@ -105,6 +119,65 @@ def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
                     parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
             parsed["dimensions"][phase][zone] = valid
     return parsed
+
+
+def repair_lesson(lesson: str, phase: str, faction_won=None) -> str | None:
+    """Deterministic best-effort repair of a malformed lesson.
+
+    Repairs:
+      1. Strip leading "- [gXXX]" / "- [DEPRECATED gXXX]" prefix and dash.
+      2. Collapse runs of whitespace.
+      3. Append a missing outcome tag (only if `faction_won` is known — exit
+         code is observable from the game, not fabricated from thin air).
+      4. Truncate to ≤35 words while preserving the trailing outcome tag.
+
+    After repair we re-run `validate_lesson_body`. If validation still
+    fails (typically because the body is missing `because` or doesn't
+    start with `When ` — content we cannot fabricate) we return `None`
+    so the caller drops the lesson instead of silently writing bad data.
+
+    Parameters
+    ----------
+    lesson : str
+        Raw lesson text emitted by the LLM.
+    phase : str
+        Phase bucket the lesson belongs to. Drives the action-stem check
+        in validation.
+    faction_won : Optional[bool]
+        Whether the lesson's faction won the game. Used to attach a
+        missing outcome tag. If `None` and the tag is absent, no repair
+        is attempted for that issue.
+    """
+    body = normalize_lesson_body(lesson)
+    if not body:
+        return None
+
+    has_win = "(observed on WIN)" in body
+    has_loss = "(observed on LOSS)" in body
+    outcome_tag = None
+    if has_win and not has_loss:
+        outcome_tag = "(observed on WIN)"
+    elif has_loss and not has_win:
+        outcome_tag = "(observed on LOSS)"
+    elif faction_won is not None:
+        outcome_tag = "(observed on WIN)" if faction_won else "(observed on LOSS)"
+        if not body.endswith("."):
+            body = body + "."
+        body = body + " " + outcome_tag
+
+    words = body.split()
+    if len(words) > 35:
+        if outcome_tag:
+            tag_words = outcome_tag.split()
+            non_tag_words = [w for w in words if w not in tag_words]
+            head_budget = 35 - len(tag_words)
+            non_tag_words = non_tag_words[: max(head_budget, 1)]
+            body = " ".join(non_tag_words) + " " + outcome_tag
+        else:
+            body = " ".join(words[:35])
+
+    ok, _ = validate_lesson_body(body, phase)
+    return body if ok else None
 
 
 def ensure_dirs():
