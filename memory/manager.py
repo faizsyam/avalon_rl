@@ -14,14 +14,64 @@ CONSOLIDATION_THRESHOLD = 3
 # All phase names that may appear in lesson files (validation / debugging).
 PHASES_ALL = ("discussion", "proposal", "vote", "mission", "assassin")
 
-# Phase-specific required action words (word stems, matched with word boundaries)
+# Phase-specific required action words (word stems, matched with word boundaries).
+# Discussion stems are kept broad because the phase covers many verbal moves
+# (challenge, demand, press, etc.) — restricting to act-of-speaking verbs alone
+# produced false rejections on otherwise high-quality lessons.
+# Proposal stems also extended with composition verbs (add, drop, remove, pair)
+# that the LLM reaches for when no other word fits. Mission stems admit the
+# observational verbs good players need ("note", "observe", "evaluate") since
+# only evil actually plays cards; the FAIL/SUCCESS substring check below
+# enforces that a *decision* or *outcome* is named regardless.
 PHASE_ACTION_STEMS = {
-    "discussion": ["say", "frame", "ask", "accuse", "deflect", "signal", "name", "propose", "steer"],
-    "proposal": ["propose", "pick", "choose", "select", "include", "exclude", "team", "test"],
+    "discussion": [
+        # Speech acts & verbal moves
+        "say", "frame", "ask", "accuse", "deflect", "signal", "name", "propose", "steer",
+        "demand", "challenge", "press", "question", "probe", "warn", "blame",
+        "attack", "defend", "counter", "support", "agree", "disagree",
+        "express", "withhold", "doubt", "claim", "downplay", "disclose",
+        "interpret", "spot", "notice", "call", "suggest",
+        "skip", "veto", "second", "echo", "parrot", "mirror",
+        # Strategic-speech moves the LLM reaches for that previously dropped lessons
+        "avoid", "expose", "reveal", "raise", "highlight", "flag", "lobby",
+        "speculate", "predict", "anticipate", "address",
+    ],
+    "proposal": [
+        # Team composition verbs
+        "propose", "pick", "choose", "select", "include", "exclude", "team", "test",
+        "add", "drop", "remove", "pair", "put", "extend", "reform", "draft",
+        "build", "shape", "form", "size", "carry", "trust", "restructure",
+        # Strategic moves that should land in proposal rather than other phases
+        "avoid", "veto", "block", "lead", "anchor",
+    ],
     "vote": ["approve", "reject", "vote"],
-    "mission": ["fail", "success", "play"],
-    "assassin": ["guess", "target", "identify", "name"]
+    "mission": [
+        "fail", "success", "play",
+        "succeed", "pass", "note", "observe", "track", "evaluate", "judge",
+        "weight", "assess", "treat", "complete", "submit", "decline",
+    ],
+    "assassin": ["guess", "target", "identify", "name", "select", "pick", "decide", "choose", "eliminate", "rule", "narrow", "evaluate", "judge"],
 }
+
+_GENERIC_ACTION_VERBS = frozenset({
+    "use", "make", "take", "give", "show", "keep", "find", "try", "need",
+    "let", "get", "set", "put", "look", "watch", "tell", "speak", "talk",
+    "listen", "hear", "think", "believe", "consider", "decide", "determine",
+    "confirm", "suspect", "doubt", "figure", "check", "verify", "weigh",
+    "balance", "compare", "identify", "track", "recognize", "distinguish",
+    "separate", "sort", "count", "note", "record", "mark", "remember",
+    "focus", "concentrate", "prioritize", "rank", "order", "manage",
+    "control", "handle", "direct", "guide", "lead", "follow", "pursue",
+    "avoid", "prevent", "protect", "guard", "cover", "hide", "conceal",
+    "mask", "disguise", "bluff", "lie", "mislead", "distract", "confuse",
+    "pressure", "force", "push", "pull", "draw", "attract", "divert",
+    "shift", "change", "adjust", "adapt", "modify", "correct", "fix",
+    "resolve", "settle", "commit", "execute", "perform", "deliver",
+    "produce", "cause", "trigger", "arrange", "plan", "prepare",
+    "signal", "communicate", "indicate", "imply", "hint", "suggest",
+    "reveal", "expose", "uncover", "demonstrate", "prove",
+    "disprove", "narrow",
+})
 
 VAGUE_PHRASES = (
     "be careful", "watch everyone", "be cautious", "read the room",
@@ -41,18 +91,39 @@ def validate_lesson(lesson: str, phase: str) -> tuple[bool, str]:
     return validate_lesson_body(body, phase)
 
 
+def validate_coordination_lesson(lesson: str, phase: str) -> tuple[bool, str]:
+    """Coordination files (evil/good coordination) describe cross-game team-coordination
+    rules, not single-game outcomes. They are allowed to omit the literal outcome tag
+    the role-validator demands, because reliability-style tags like "(reliable on WIN,
+    untested on LOSS)" carry the same commitment. The structural requirements that
+    *cannot* be falsified — "When ", "because ", phase-appropriate action verb, length
+    — still hold for coord files so the file stays machine-readable."""
+    if not lesson or not lesson.strip():
+        return False, "empty lesson"
+    body = normalize_lesson_body(lesson)
+    return validate_lesson_body(body, phase, require_outcome_tag=False)
+
+
 def normalize_lesson_body(lesson: str) -> str:
     """Strip the leading "- [gXXX]" / "- [DEPRECATED gXXX]" prefix and any
-    leading dash so the body can be validated on its own."""
+    leading dash, and any trailing {grounding: ...} suffix,
+    so the body can be validated on its own."""
     s = lesson.strip()
     s = re.sub(r'^-\s*\[(?:DEPRECATED\s+)?g\d+\]\s*', '', s)
     s = re.sub(r'^-\s*', '', s).strip()
-    return re.sub(r'\s+', ' ', s)
+    s = re.sub(r'\s+', ' ', s)
+    # Strip grounding metadata suffix
+    s = re.sub(r'\s*\{grounding:\s*[^}]+\}\s*$', '', s).strip()
+    return s
 
 
-def validate_lesson_body(body: str, phase: str) -> tuple[bool, str]:
+def validate_lesson_body(body: str, phase: str, require_outcome_tag: bool = True) -> tuple[bool, str]:
     """Validate an already-normalized lesson body (marker prefix + dash stripped,
-    whitespace collapsed). Returns (is_valid, reason_if_invalid)."""
+    whitespace collapsed). Returns (is_valid, reason_if_invalid).
+
+    `require_outcome_tag` defaults True (role files). Coordination files pass False
+    — their rules aggregate across many games and don't admit a single-game outcome
+    tag."""
     if not body:
         return False, "empty lesson"
 
@@ -61,36 +132,55 @@ def validate_lesson_body(body: str, phase: str) -> tuple[bool, str]:
         return False, f"exceeds 35 words ({len(words)})"
     if not body.startswith("When "):
         return False, "must start with 'When '"
-    if " do " not in body and " Do " not in body:
-        # Action phrase; recasts of action verbs (REJECT/FAIL/etc.) at
-        # the top of the rule are handled by the phase stem check below.
-        pass  # Phase-action-stem check below catches the same cases.
-    if " because " not in body:
+
+    # The phase-specific action-stem check below enforces the "do Y" verb;
+    # treating bare REJECT/FAIL-style tokens as equivalent. Skipping an
+    # extra " do " substring check avoids rejecting lessons that lead with
+    # the action verb directly ("When X, REJECT because...").
+    if " because " not in body and " Because " not in body and not re.search(r"\bbecause\b", body, re.IGNORECASE):
         return False, "must contain ' because ' (causal reason)"
 
     has_win = "(observed on WIN)" in body
     has_loss = "(observed on LOSS)" in body
-    if not (has_win or has_loss):
-        return False, "must end with '(observed on WIN)' or '(observed on LOSS)'"
-    if has_win and has_loss:
-        return False, "cannot have both WIN and LOSS tags"
+    if require_outcome_tag:
+        if not (has_win or has_loss):
+            return False, "must end with '(observed on WIN)' or '(observed on LOSS)'"
+        if has_win and has_loss:
+            return False, "cannot have both WIN and LOSS tags"
 
     # Phase-specific required action content.
     if phase == "vote":
-        if "APPROVE" not in body and "REJECT" not in body:
+        if not re.search(r"\bAPPROVE\b|\bREJECT\b", body):
             return False, "vote lesson must specify APPROVE or REJECT"
     elif phase == "mission":
-        if "FAIL" not in body and "SUCCESS" not in body:
+        # Lessons concern the OUTCOME (success/fail) of a quest — for card-players
+        # who decide FAIL vs SUCCESS, and for good roles who observe outcomes.
+        # Accept any case and verb form ('SUCCESS', 'succeeds', '0-fail', 'failed',
+        # 'passed', 'clean pass', etc.). The case-sensitive FAIL/SUCCESS check
+        # rejected otherwise-solid lessons for stylistic wording.
+        outcome_signal = re.search(
+            r"\bSUCCESS\b|\bFAIL(?:S|ED|URE)?\b|\bSUCCEED(?:S|ED|ING)?\b|"
+            r"\bPASS(?:ES|ED|ING)?\b|0\s*-\s*fail|0\s*-\s*pass|clean\s+pass",
+            body,
+            re.IGNORECASE,
+        )
+        if not outcome_signal:
             return False, "mission lesson must specify FAIL or SUCCESS"
     elif phase == "assassin":
         if "guess" not in body.lower() and "target" not in body.lower():
             return False, "assassin lesson must mention guess or target"
 
     # Phase-specific required action stem (word-boundary, case-insensitive).
+    # Cascading check: first try phase-specific stems, then fall back to
+    # generic action verbs. Only reject if NEITHER matches — this catches
+    # obvious non-action lessons like "When X, the game is hard because Y"
+    # while accepting valid lessons whose verbs happen to be outside the
+    # phase-specific list.
     action_stems = PHASE_ACTION_STEMS.get(phase, [])
     if action_stems:
         if not any(re.search(rf'\b{re.escape(stem)}\w*\b', body, re.IGNORECASE) for stem in action_stems):
-            return False, f"phase '{phase}' lesson must contain a phase-appropriate action verb"
+            if not any(re.search(rf'\b{re.escape(v)}\w*\b', body, re.IGNORECASE) for v in _GENERIC_ACTION_VERBS):
+                return False, f"phase '{phase}' lesson must contain a phase-appropriate action verb"
 
     lower_body = body.lower()
     for vague in VAGUE_PHRASES:
@@ -100,14 +190,18 @@ def validate_lesson_body(body: str, phase: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
-    """Remove any invalid lessons from active/tentative zones after LLM consolidation."""
+def _filter_valid_lessons(parsed: dict, phases: list, game_id: int, *,
+                         validator=validate_lesson) -> dict:
+    """Remove any invalid lessons from active/tentative zones after LLM consolidation.
+    `validator` defaults to the strict role validator; coord callers pass
+    `validate_coordination_lesson` so coord lessons without a literal outcome tag
+    are kept."""
     for phase in phases:
         for zone in ("active", "tentative"):
             lst = parsed["dimensions"][phase][zone]
             valid = []
             for lesson in lst:
-                ok, _ = validate_lesson(lesson, phase)
+                ok, _ = validator(lesson, phase)
                 if ok:
                     valid.append(lesson)
                 else:
@@ -118,6 +212,29 @@ def _filter_valid_lessons(parsed: dict, phases: list, game_id: int) -> dict:
                     )
                     parsed["dimensions"][phase]["deprecated"].append(deprecated_entry)
             parsed["dimensions"][phase][zone] = valid
+    return parsed
+
+
+def _auto_promote_aged_tentative(parsed: dict, current_game_id: int) -> dict:
+    """Promote any tentative entry whose [gXXX] tag list does NOT include the
+    current game into ACTIVE.
+
+    Why this exists: the consolidator's LLM call rarely merges two near-duplicate
+    tentative entries across games (it varies wording round-to-round). Without a
+    mechanical promotion path, tentative zones fill the cap, new insights are
+    silently dropped on _apply_delta, and lesson learning stalls. Any lesson that
+    has survived at least one round without being deprecated has, by definition,
+    accumulated enough evidence to enter ACTIVE."""
+    for phase in parsed["dimensions"]:
+        tentative = list(parsed["dimensions"][phase].get("tentative", []))
+        still_tentative = []
+        for entry in tentative:
+            tag_ids = [int(m) for m in re.findall(r"\[g(\d+)\]", entry) if m.isdigit()]
+            if tag_ids and all(t < current_game_id for t in tag_ids):
+                parsed["dimensions"][phase].setdefault("active", []).append(entry)
+            else:
+                still_tentative.append(entry)
+        parsed["dimensions"][phase]["tentative"] = still_tentative
     return parsed
 
 
@@ -404,18 +521,37 @@ _STOPWORDS = frozenset({
 
 
 def _match_lesson_phrase(lesson: str, keyword: str) -> bool:
-    """Tight match for confirm_active/flag_deprecated. The keyword must either be a
-    substring of the normalized lesson body, or have all its words appear in order.
-    Generic words like 'evil' or 'fail' cannot accidentally promote unrelated
-    lessons because the substring check requires the literal phrase."""
+    """Match a reflector's `keyword` to a stored lesson entry.
+
+    Three-tier matching, in order of decreasing strictness:
+      1. Whole substring containment (most precise: "team composition signal"
+         matches only lessons literally containing that phrase).
+      2. Word-boundary containment with ALL keyword tokens in any order
+         (catches "team composition" and "composition of the team" but rejects
+         the single-word "fail" matching every lesson mentioning fails).
+      3. As a final fallback, hard floor: keywords of <4 chars or that
+         match a too-common word are rejected outright.
+
+    Generic words like 'evil', 'fail', 'team' can no longer accidentally
+    promote unrelated lessons because they must either appear as a literal
+    substring OR all appear as standalone tokens (each ≥4 chars or with the
+    stopword filter applied).
+    """
     norm = _normalize_lesson(lesson)
     key = keyword.strip().lower()
     if not key:
         return False
     if key in norm:
         return True
-    words = key.split()
-    return _words_in_order(norm, words)
+    # Tier 2: all keyword tokens must appear as tokens (with the stopword
+    # filter excluding the most common function-words). Reject when key is
+    # clearly too short or generic to be a reliable selector.
+    key_tokens = [t for t in re.findall(r"[a-z]+", key) if t not in _STOPWORDS and len(t) >= 3]
+    if not key_tokens or len(key_tokens) == 0:
+        # All tokens filtered out as stopwords/too-short — refuse ambiguous match.
+        return False
+    norm_word_set = set(re.findall(r"[a-z]+", norm)) - _STOPWORDS
+    return all(t in norm_word_set for t in key_tokens)
 
 
 def _words_in_order(haystack: str, words: List[str]) -> bool:
@@ -426,6 +562,8 @@ def _words_in_order(haystack: str, words: List[str]) -> bool:
             return False
         pos = idx + len(w)
     return True
+# Backward-compat re-export — older callers may still import `_words_in_order`.
+__all__ = ("_words_in_order",)
 
 
 def _write(path: str, content: str):
@@ -437,8 +575,9 @@ def _write(path: str, content: str):
         raise RuntimeError(f"_write to {path} produced suspiciously short file ({len(written)} chars)")
 
 
-def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
+def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> tuple[Dict, set]:
     tag = f"[g{game_id:03d}]"
+    skipped_phases = set()
 
     # ---- add_tentative ----
     for item in delta.get("add_tentative", []):
@@ -454,26 +593,39 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
 
         existing_tentative = parsed["dimensions"][phase]["tentative"]
         if len(existing_tentative) >= TENTATIVE_CAP:
+            skipped_phases.add(phase)
             continue
 
         all_existing = existing_tentative + parsed["dimensions"][phase]["active"]
         if _is_near_duplicate(lesson, all_existing):
             continue
 
-        parsed["dimensions"][phase]["tentative"].append(f"- {tag} {lesson}")
+        grounding = item.get("grounding", "").strip()
+        grounding_suffix = f" {{grounding: {grounding}}}" if grounding else ""
+        parsed["dimensions"][phase]["tentative"].append(f"- {tag} {lesson}{grounding_suffix}")
 
     for item in delta.get("confirm_active", []):
         if not isinstance(item, dict):
             continue
         raw_phase = item.get("phase", "") or item.get("dimension", "")
+        lesson_text = item.get("lesson", "").strip()
         keyword = item.get("keyword", "").lower().strip()
         phase = _resolve_phase(parsed["dimensions"], raw_phase)
-        if not phase or not keyword:
+        if not phase:
+            continue
+        if not lesson_text and not keyword:
             continue
 
         tentative = parsed["dimensions"][phase]["tentative"]
         for i, t in enumerate(tentative):
-            if _match_lesson_phrase(t, keyword):
+            match = False
+            if lesson_text:
+                norm_target = _normalize_lesson(lesson_text)
+                norm_stored = _normalize_lesson(t)
+                match = lesson_text in t or norm_target in norm_stored
+            elif keyword:
+                match = _match_lesson_phrase(t, keyword)
+            if match:
                 parsed["dimensions"][phase]["active"].append(t)
                 tentative.pop(i)
                 break
@@ -482,15 +634,25 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
         if not isinstance(item, dict):
             continue
         raw_phase = item.get("phase", "") or item.get("dimension", "")
+        lesson_text = item.get("lesson", "").strip()
         keyword = item.get("keyword", "").lower().strip()
         reason = item.get("reason", "").strip()
         phase = _resolve_phase(parsed["dimensions"], raw_phase)
-        if not phase or not keyword:
+        if not phase:
+            continue
+        if not lesson_text and not keyword:
             continue
         for zone in ("active", "tentative"):
             lst = parsed["dimensions"][phase][zone]
             for i, line in enumerate(lst):
-                if _match_lesson_phrase(line, keyword):
+                match = False
+                if lesson_text:
+                    norm_target = _normalize_lesson(lesson_text)
+                    norm_stored = _normalize_lesson(line)
+                    match = lesson_text in line or norm_target in norm_stored
+                elif keyword:
+                    match = _match_lesson_phrase(line, keyword)
+                if match:
                     deprecated_entry = (
                         f"- [DEPRECATED {tag}] {line.lstrip('- ')}"
                         + (f" — {reason}" if reason else "")
@@ -499,30 +661,32 @@ def _apply_delta(parsed: Dict, delta: dict, game_id: int) -> Dict:
                     lst.pop(i)
                     break
 
-    return parsed
+    return parsed, skipped_phases
 
-def apply_lesson_delta(role: str, delta: dict, game_id: int):
-    _apply_delta_to_path(get_lesson_path(role), ROLES_CONFIG[role]["phases"], delta, game_id)
-
-
-def apply_evil_coord_delta(delta: dict, game_id: int):
-    _apply_delta_to_path(EVIL_COORD_FILE, EVIL_COORD_PHASES, delta, game_id)
+def apply_lesson_delta(role: str, delta: dict, game_id: int) -> set:
+    return _apply_delta_to_path(get_lesson_path(role), ROLES_CONFIG[role]["phases"], delta, game_id)
 
 
-def apply_good_coord_delta(delta: dict, game_id: int):
-    _apply_delta_to_path(GOOD_COORD_FILE, GOOD_COORD_PHASES, delta, game_id)
+def apply_evil_coord_delta(delta: dict, game_id: int) -> set:
+    return _apply_delta_to_path(EVIL_COORD_FILE, EVIL_COORD_PHASES, delta, game_id)
 
 
-def _apply_delta_to_path(path: str, phases: List[str], delta: dict, game_id: int):
-    """Single apply path for role lesson files AND coordination files."""
+def apply_good_coord_delta(delta: dict, game_id: int) -> set:
+    return _apply_delta_to_path(GOOD_COORD_FILE, GOOD_COORD_PHASES, delta, game_id)
+
+
+def _apply_delta_to_path(path: str, phases: List[str], delta: dict, game_id: int) -> set:
+    """Single apply path for role lesson files AND coordination files.
+    Returns the set of phases where lessons were skipped due to tentative cap."""
     if not os.path.exists(path):
         # Initialize with the right headers and phase structure on first write.
         header_label = os.path.basename(path).replace(".txt", "").upper().replace("_", " ")
         _init_file(path, header_label, phases)
     parsed = _parse_file(path, phases)
-    parsed = _apply_delta(parsed, delta, game_id)
+    parsed, skipped_phases = _apply_delta(parsed, delta, game_id)
     parsed = _bump_version(parsed, game_id)
     _write(path, _serialize(parsed, phases))
+    return skipped_phases
 
 
 def _init_file(path: str, header_label: str, phases: List[str]):
@@ -591,21 +755,32 @@ def _restore_dropped_active(updated_parsed, original_parsed, phases):
 def consolidate_lessons(role: str, llm, game_id: int):
     """LLM-driven consolidation pass for a single role's phase-bucketed lesson file."""
     consolidate_file(get_lesson_path(role), ROLES_CONFIG[role]["phases"], role, llm, game_id,
-                     active_cap=ACTIVE_CAP, tentative_cap=TENTATIVE_CAP)
+                     active_cap=ACTIVE_CAP, tentative_cap=TENTATIVE_CAP,
+                     validator=validate_lesson)
 
 
 def consolidate_evil_coord(llm, game_id: int):
     consolidate_file(EVIL_COORD_FILE, EVIL_COORD_PHASES, "evil coordination", llm, game_id,
-                     active_cap=3, tentative_cap=2)
+                     active_cap=3, tentative_cap=2,
+                     validator=validate_coordination_lesson)
 
 
 def consolidate_good_coord(llm, game_id: int):
     consolidate_file(GOOD_COORD_FILE, GOOD_COORD_PHASES, "good coordination", llm, game_id,
-                     active_cap=3, tentative_cap=2)
+                     active_cap=3, tentative_cap=2,
+                     validator=validate_coordination_lesson)
 
 
-def consolidate_file(path: str, phases, label: str, llm, game_id: int, active_cap: int, tentative_cap: int):
-    """Single consolidation entry point shared by role and coordination files."""
+def consolidate_file(path: str, phases, label: str, llm, game_id: int,
+                     active_cap: int, tentative_cap: int,
+                     validator=validate_lesson):
+    """Single consolidation entry point shared by role and coordination files.
+
+    `validator` is the lesson-shape validator; coord callers pass
+    `validate_coordination_lesson` so coord rules without a literal outcome tag
+    survive the filter pass. Use of `_auto_promote_aged_tentative` ensures that
+    lessons that have aged past the current round move to ACTIVE, even when the
+    LLM-driven merger step does not produce a duplicate."""
     if not os.path.exists(path):
         return
     current = open(path, "r", encoding="utf-8").read()
@@ -620,7 +795,10 @@ def consolidate_file(path: str, phases, label: str, llm, game_id: int, active_ca
     updated_parsed = _parse(updated, phases)
     original_parsed = _parse(current, phases)
     updated_parsed = _restore_dropped_active(updated_parsed, original_parsed, phases)
-    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id)
+    # Mechanical promotion FIRST so LLM consolidation cannot accidentally
+    # re-promote (or lose) an already-stable rule into the deprecated pile.
+    updated_parsed = _auto_promote_aged_tentative(updated_parsed, game_id)
+    updated_parsed = _filter_valid_lessons(updated_parsed, phases, game_id, validator=validator)
     updated_parsed = _bump_version(updated_parsed, game_id)
     _write(path, _serialize(updated_parsed, phases))
 

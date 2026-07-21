@@ -73,11 +73,29 @@ def run():
         print_reflection_header()
         deltas = run_reflection(state, reflection_llm)
         for role, n in (deltas or {}).items():
+            if role.startswith("_"):
+                continue
             total = n["tentative"] + n["confirmed"] + n["deprecated"] if isinstance(n, dict) else n
             print_reflection_role(role, total)
 
         snapshot_lessons(metrics, game_id)
         save_metrics(metrics)
+
+        # On-demand consolidation for roles that hit tentative cap
+        roles_needed = (deltas or {}).get("_consolidate_needed", set())
+        consolidated_now = False
+        if roles_needed:
+            print(f"    [CONSOLIDATE ON-DEMAND] Roles at tentative cap: {roles_needed}")
+            for role in ALL_ROLES:
+                if role in roles_needed:
+                    consolidate_lessons(role, llm, game_id)
+            if "evil_coord" in roles_needed:
+                consolidate_evil_coord(llm, game_id)
+            if "good_coord" in roles_needed:
+                consolidate_good_coord(llm, game_id)
+            snapshot_lessons(metrics, game_id)
+            save_metrics(metrics)
+            consolidated_now = True
 
         if game_id % CHECKPOINT_EVERY == 0:
             save_checkpoint(game_id)
@@ -88,7 +106,7 @@ def run():
             (game_id > max(EARLY_CONSOLIDATION_GAMES, default=0) and game_id % CONSOLIDATION_EVERY == 0) or
             should_consolidate_now()
         )
-        if should_consolidate:
+        if should_consolidate and not consolidated_now:
             print_consolidation()
             for role in ALL_ROLES:
                 consolidate_lessons(role, llm, game_id)

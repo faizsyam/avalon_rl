@@ -8,17 +8,22 @@ from memory.manager import load_lessons, load_evil_coord, load_good_coord
 PHASE_MEMORY_LINE_CAP = 140
 # Per-agent, per-phase bullet cap. Older entries are evicted when new ones push
 # beyond this — keeps the in-prompt memory layer bounded.
-PHASE_MEMORY_PER_PHASE_CAP = 4
+PHASE_MEMORY_PER_PHASE_CAP = 3
 # Hard ceiling on the size of the deterministic running digest the engine
 # rebuilds after each mission / vote outcome.
-RUNNING_DIGEST_LINE_CAP = 12
+RUNNING_DIGEST_LINE_CAP = 10
+# Cap on vote-speech quotes kept inline in the in-prompt vote history. Past
+# games showed full speeches bloating prompts faster than the LLM could read.
+VOTE_SPEECH_QUOTE_CAP = 120
+# Cap on discussion statements kept inline in the per-phase prompt.
+DISCUSSION_STATEMENT_QUOTE_CAP = 160
 
 # Compact, decision-oriented game rules. Section headers preserved for status
 # signals but every line carries information the agent needs to act.
 GAME_RULES = """
 GAME: The Resistance: Avalon (5 players). Factions: Good (Merlin, Percival, Loyal Servant — 3), Evil (Assassin, Morgana — 2). Players addressed by name.
 
-WIN:
+WIN CONDITIONS:
 - Good: complete 3 successful quests AND survive Assassin's final Merlin guess.
 - Evil: fail 3 quests, OR guess Merlin correctly after good reaches 3, OR trigger 5 consecutive rejections on one quest.
 
@@ -35,7 +40,7 @@ QUEST FLOW (≤5 quests; first to 3 quest wins ends the quest phase):
 4. MISSION — team members secretly play. Good must play SUCCESS; evil chooses. ≥1 FAIL = quest fails. Only the NUMBER of fails is public, never who played them.
 5. ASSASSIN PHASE — if good reached 3, Assassin names Merlin. Correct = evil wins, wrong = good wins.
 
-PUBLIC MATH:
+PUBLIC MATH (deterministic, no hidden info required):
 - N fails on N-person team → all N are confirmed evil.
 - 1 fail on 2-person team → at least 1 of 2 is evil.
 - 2 fails on 3-person team → at least 2 of 3 are evil.
@@ -47,70 +52,71 @@ TEAM SIZES: Q1=2, Q2=3, Q3=2, Q4=3, Q5=3.
 ROLE_CONTEXT = {
     "Merlin": """
 === MERLIN (GOOD) ===
-Help good reach 3 successes and survive the Assassin's final Merlin guess.
-You know evil by name from the start. Good always plays SUCCESS on missions.
-Key risk: the Assassin is hunting YOU. Rejecting only teams with evil, or always proposing safe players, leaks your hidden knowledge.
-Frame EVERY public statement as a deduction from PUBLIC evidence (votes/proposals/outcomes). Say "X's vote on Q2 aligns with evil incentives", never "I know X is evil." Role-aware reasoning belongs in private_note only.
+Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
+Hidden knowledge: You know the 2 evil players by name from the start.
+Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
+Assassin tells (observed patterns): rejection-heavy voting patterns, specific naming without public evidence, aggregate statistical claims without visible basis, early analytical dominance.
 """,
 
     "Percival": """
 === PERCIVAL (GOOD) ===
-Help good reach 3 successes and survive the Assassin's final Merlin guess.
-You see TWO players as Merlin — one is real Merlin, the other is Morgana (evil). You cannot tell which directly.
-Watch whose team guidance actually proves correct over the game; align your votes with that candidate. Externally, act with measured trust toward whichever one; never declare either as Merlin publicly. Good always plays SUCCESS.
+Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
+Hidden knowledge: You see 2 players as "Merlin" (real Merlin + Morgana). You cannot tell them apart directly.
+Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
+Assassin tells (observed patterns): naming both Merlin candidates by name in public, perfect lockstep with one candidate, using phrases like "my candidates" or "the two I see as Merlin".
 """,
 
     "LoyalServant": """
 === LOYAL SERVANT (GOOD) ===
-Help good reach 3 successes and survive the Assassin's final Merlin guess.
-No hidden info. Your strength is public deduction: cite specific named behavior (e.g. "X was on Q1 and Q3 fails"). A failed quest proves ≥ fail-count evil on the team; a success proves nothing. "I don't know" is honest and not a Merlin tell. Good always plays SUCCESS.
+Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
+Hidden knowledge: None. You reason only from observable evidence: votes, proposals, quest outcomes, statements.
+Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
+Public math: A failed quest proves ≥ fail-count evil on the team; a success proves nothing (evil may play SUCCESS for cover).
+Strength: Your deductions are publicly derivable — you prove good can sound like a confident reader. "I don't know" is honest and not a Merlin tell.
 """,
 
     "Assassin": """
 === ASSASSIN (EVIL) ===
-Fail 3 quests before good reaches 3, OR guess Merlin correctly if good reaches 3.
-You know Morgana only. On missions choose SUCCESS (cover) or FAIL (sabotage) — one FAIL fails the quest. You or Morgana alone can FAIL.
-Avoid lockstep voting with Morgana, identical arguments, or failing together on small teams (2 fails on 2-person team exposes you both). After every decision, write a private note tracking the most-Merlin-like behavior for the eventual guess.
+Faction: Evil. Win condition: fail 3 quests before good reaches 3, OR guess Merlin correctly if good reaches 3.
+Hidden knowledge: You know Morgana (your evil ally) by name.
+Mission play: Evil chooses SUCCESS (cover) or FAIL (sabotage). One FAIL fails the quest. You or Morgana alone can FAIL.
+Observed tells (Assassin-visible): lockstep voting with Morgana, identical arguments, double-failing a small team (2 fails on 2-person team mathematically exposes both evil players).
 """,
 
     "Morgana": """
 === MORGANA (EVIL) ===
-Fail 3 quests before good reaches 3, OR help the Assassin identify Merlin if good reaches 3.
-You know the Assassin only. On missions choose SUCCESS or FAIL. You appear as "Merlin" to Percival — imitate evidence-based confidence to look like one of the candidates.
-Vary your votes/arguments from the Assassin to avoid lockstep tell. Double-failing a small team reveals you both. Help the Assassin track Merlin through shared private reads.
+Faction: Evil. Win condition: fail 3 quests before good reaches 3, OR help the Assassin identify Merlin if good reaches 3.
+Hidden knowledge: You know the Assassin (your evil ally) by name.
+Mission play: Evil chooses SUCCESS or FAIL. You appear as "Merlin" to Percival.
+Observed tells: Lockstep voting with the Assassin is detectable. Double-failing a small team reveals both evil players. You can help the Assassin track Merlin through shared private reads.
 """,
 }
 
 # Single compact directives block — merged from the prior OPSEC /
 # COMMUNICATION / NOTE trio. Every line still earns its keep.
 DIRECTIVES = """
-=== RULES YOU MUST FOLLOW ===
+=== ENVIRONMENTAL FACTS ===
 
 PUBLIC vs PRIVATE:
-- Discussion statements, vote speeches, and the public team you propose are PUBLIC. Everyone hears them.
-- private_note, internal_note, reasoning are PRIVATE — never spoken aloud.
+- Discussion statements, vote speeches, and your proposed team are PUBLIC (everyone hears them).
+- private_note / internal_note / reasoning are PRIVATE — never spoken aloud.
 
-OPSEC (your role and hidden knowledge are private):
-- Never state your exact role, faction, or hidden knowledge publicly.
-- Never claim certainty about another player's role without observable evidence.
-- Role-aware reasoning goes in private_note / internal_note ONLY.
+OPSEC: never state your role, faction, or hidden knowledge publicly. Role-aware reasoning goes ONLY in private_note / internal_note.
 
-SPEAKING STYLE (public statements):
-- Refer to yourself as "I"/"me", never by name.
-- Address other players by name.
-- React to specific statements and game events — not generic platitudes.
-- Cite a specific named player's vote, proposal, or statement when justifying.
+SPEAKING STYLE: refer to yourself as "I"/"me", never by name. Cite a SPECIFIC named player (vote, proposal, or statement) when you justify a position.
 
-PRIVATE NOTES (after each action):
-- ONE LINE only (~25 words). The engine keeps your private_note across the whole game and surfaces it later; verbose notes bloat later prompts.
-- Name specific players. State what their behavior moved on YOUR read — not raw facts already visible in the game history.
-- Prefer triggers over facts: "Bob voted REJECT on my Q2 team at 2-2 — now in suspect pool" beats "Bob voted REJECT".
-- Drop weak/vague updates ("nothing new", "still unsure"). If nothing moved this turn, write "".
-- Write a note after your discussion statement, your vote, and your mission card play.
+PRIVATE NOTE — one tight line, ~25 words: name a player and what their behavior MOVED on your read. Drop weak/no-movement updates (write ""). Your private_note is your future memory — make it count.
 
-TWO-LAYER MEMORY — what you see vs what the engine keeps:
-- The prompt you receive has TWO memory layers. The "READS SO FAR" block is a deterministic snapshot the engine rebuilt from public events — trust it as ground truth. The "MY PAST NOTES" block is your own prior private_notes from earlier phases this game; both layers persist across phases.
-- The engine CAPS your stored notes. Anything not in those capped layers is gone — what you write in private_note IS your future memory, so make it count.
+MEMORY YOU SEE IN THE PROMPT:
+- "YOUR STATE" (deterministic digest from public events — trust as ground truth)
+- "MY PAST NOTES" (your own past private_notes, capped at the last 3 per phase)
+The engine CAPS stored notes. Anything not in those layers is gone.
+
+ROLE-SPECIFIC OBSERVABLES:
+- Merlin: knows evil identities from start. Any public reasoning that could ONLY come from this knowledge is a tell.
+- Percival: sees two Merlin candidates. Perfect alignment with one is a tell. Naming both by name is a tell.
+- LoyalServant: no hidden info. All reasoning is publicly derivable. "I don't know" is honest.
+- Assassin / Morgana: know each other. Lockstep voting/arguments with your ally is a tell. Double-failing a small team exposes both.
 """
 
 
@@ -311,7 +317,7 @@ def _build_vote_history(state) -> str:
     if not state.vote_history:
         return ""
     all_votes = state.vote_history
-    lines = ["PROPOSALS & VOTES (all statements are public — everyone heard these):"]
+    lines = ["PROPOSALS & VOTES (public — every player saw every speech):"]
     for v in all_votes:
         team = [_n(state, s) for s in v.proposed_team]
         proposer = _n(state, v.proposer_slot)
@@ -319,23 +325,12 @@ def _build_vote_history(state) -> str:
         for slot in range(5):
             name = _n(state, slot)
             vote = v.votes.get(slot, "?")
-            speech = v.speeches.get(slot, "").strip()
+            speech = v.votes.get(slot, "?") and v.speeches.get(slot, "").strip()
             if speech and speech != "...":
-                lines.append(f'    {name} [{vote}]: "{speech}"')
+                if len(speech) > VOTE_SPEECH_QUOTE_CAP:
+                    speech = speech[:VOTE_SPEECH_QUOTE_CAP - 1].rstrip() + "…"
+                lines.append(f'    {name}[{vote[0]}]: "{speech}"')
     return "\n".join(lines)
-
-
-def _build_private_notes(state, my_slot: int) -> str:
-    """Legacy verbose note stream. Kept in state.agent_notes for the
-    reflection pass at game end. The IN-PROMPT memory layer is now served
-    by the layered blocks above (`_build_phase_memory` + `build_running_digest`);
-    this function is a small safety-net showing the most-recent raw notes so
-    we don't double-feed what the layered blocks already cover."""
-    notes = state.agent_notes.get(my_slot, [])
-    if not notes:
-        return ""
-    recent = notes[-3:]
-    return "PAST RAW NOTES (recent):\n" + "\n".join(recent)
 
 
 def _build_phase_memory(state, my_slot: int, current_phase: str) -> str:
@@ -580,24 +575,25 @@ def _build_current_discussion(state) -> str:
     entries = [d for d in state.discussion_log if d.quest_num == state.quest_num]
     if not entries:
         return ""
-    lines = [f"DISCUSSION SO FAR — Q{state.quest_num} (all public):"]
+    lines = [f"DISCUSSION SO FAR — Q{state.quest_num} (public):"]
     for d in entries:
-        lines.append(f'  {_n(state, d.slot_id)}: "{d.statement}"')
+        stmt = d.statement
+        if not stmt:
+            stmt = "..."
+        if len(stmt) > DISCUSSION_STATEMENT_QUOTE_CAP:
+            stmt = stmt[:DISCUSSION_STATEMENT_QUOTE_CAP - 1].rstrip() + "…"
+        lines.append(f'  {_n(state, d.slot_id)}: "{stmt}"')
     return "\n".join(lines)
 
 
 def _format_memory_layer(state, my_slot: int, current_phase: str) -> str:
-    """Compose the two-layer memory block: deterministic digest + agent's
-    own past phase notes. Inserted FIRST in the prompt so the agent reads
-    its compressed memory before wading through raw context.
-
-    `current_phase`: which phase the prompt is for. Lets us shape ordering
-    and keep digest-first even when no per-phase memory exists yet.
-    """
+    """Compose the in-prompt memory block: deterministic digest + agent's
+    own past phase notes. Inserted near the top of the prompt so the agent
+    reads its compressed state before wading through raw context."""
     digest_lines = build_running_digest(state, my_slot)
     memory_block = _build_phase_memory(state, my_slot, current_phase)
 
-    parts = ["=== MEMORY (what you carry into this phase) ==="]
+    parts = ["=== YOUR STATE (digest + own past notes) ==="]
     parts.append("\n".join(digest_lines))
     if memory_block:
         parts.append("")
@@ -606,45 +602,39 @@ def _format_memory_layer(state, my_slot: int, current_phase: str) -> str:
 
 
 def _build_game_context(state, my_slot: int) -> str:
+    """Compressed game context block. The deterministic digest (built in
+    `build_running_digest`) already covers quest math, confirmed-evil, voting
+    patterns, and per-player quest marks — so this block only adds the things
+    the digest cannot derive cheaply (current round, leader rotation, name roster,
+    role-specific hidden knowledge, full vote speeches, full discussion quotes).
+    Past private notes live in the per-phase memory layer (`_build_phase_memory`),
+    so this block does NOT repeat them."""
     my_name = _n(state, my_slot)
     leader_name = _n(state, state.leader_slot)
-    # Order matters: the memory layer goes FIRST so the agent reads its
-    # compressed cross-phase state before raw context. The "current phase"
-    # (discussion/vote/mission/etc.) is supplied by the calling prompt.
     parts = [
-        f"=== Q{state.quest_num}/5 (team size: {QUEST_TEAM_SIZES[state.quest_num - 1]}) | Good: {state.good_wins} | Evil: {state.evil_wins} ===",
-        f"You are {my_name}. Refer to yourself as 'I'/'me', never by name.\nCurrent leader: {leader_name}.", "",
-        _build_name_roster(state, my_slot), "",
+        f"=== Q{state.quest_num}/5 (team size: {QUEST_TEAM_SIZES[state.quest_num - 1]}) | Good {state.good_wins} | Evil {state.evil_wins} ===",
+        f"You are {my_name}. Use 'I'/'me', never your name. Leader: {leader_name}.",
+        "",
+        _build_name_roster(state, my_slot),
+        "",
     ]
     reminder = _build_role_knowledge_reminder(state, my_slot)
     if reminder:
         parts += [reminder, ""]
+    # Mission deductions are role-aware and complement (not duplicate) the digest.
     deductions = _build_mission_deductions(state, my_slot)
     if deductions:
         parts += [deductions, ""]
-    cev = _build_confirmed_evil_players(state, my_slot)
-    if cev:
-        parts += [cev, ""]
     mh = _build_quest_roadmap(state, my_slot)
     if mh:
         parts += [mh, ""]
-    lr = _build_leader_rotation(state)
-    if lr:
-        parts += [lr, ""]
     vh = _build_vote_history(state)
     if vh:
         parts += [vh, ""]
     disc = _build_current_discussion(state)
     if disc:
         parts += [disc, ""]
-    notes = _build_private_notes(state, my_slot)
-    if notes:
-        parts += [notes, ""]
     return "\n".join(parts)
-
-def _build_player_quest_summary_unused(_state) -> str:
-    """Removed; per-player succ/fail markers are now embedded in _build_quest_roadmap."""
-    return ""
 
 def _build_quest_roadmap(state, my_slot: int) -> str:
     completed = {m.quest_num: m for m in state.mission_history}
@@ -657,61 +647,29 @@ def _build_quest_roadmap(state, my_slot: int) -> str:
             succ_mark = "✓" if m.result == "SUCCESS" else "✗"
             if m.result == "FAIL":
                 if m.num_fails == size:
-                    deduction = f" — all {size} members mathematically confirmed evil"
+                    deduction = f" — {size}/{size} confirmed evil"
                 else:
-                    deduction = f" — at least {m.num_fails} of these {size} players are evil"
+                    deduction = f" — ≥{m.num_fails}/{size} evil"
             else:
-                deduction = " — success does not confirm anyone as good"
-            lines.append(f"  Q{q} ({size}p) {succ_mark}: {[_n(state, s) for s in m.team]} → {m.result} ({m.num_fails} fail){you}{deduction}")
+                deduction = ""
+            lines.append(f"  Q{q} ({size}p) {succ_mark}: {[_n(state, s) for s in m.team]} → {m.result} ({m.num_fails}f){you}{deduction}")
         elif q == state.quest_num:
             proposal_count = len([v for v in state.vote_history if v.quest_num == q])
-            lines.append(f"  Q{q} ({size}p): ← CURRENT (proposal {proposal_count + 1}/5)")
+            lines.append(f"  Q{q} ({size}p): ← CURRENT P{proposal_count + 1}/5")
         else:
             lines.append(f"  Q{q} ({size}p): upcoming")
 
-    # Per-player comp across completed quests — replaces the old separate
-    # _build_player_quest_summary block (which produced duplicate information).
-    if state.mission_history:
-        record = {name: [] for name in state.slot_to_name.values()}
-        for m in state.mission_history:
-            for slot in m.team:
-                record[state.slot_to_name[slot]].append(f"Q{m.quest_num}{'✓' if m.result == 'SUCCESS' else '✗'}")
-        lines.append("  —" + "—" * 38)
-        for name, marks in record.items():
-            lines.append(f"  {name}: {' '.join(marks) if marks else 'no quests yet'}")
-
-    if ROLES_CONFIG[state.slot_to_role[my_slot]]["faction"] == "good":
-        fail_teams = [set(m.team) for m in state.mission_history if m.result == "FAIL"]
-        if len(fail_teams) >= 2:
-            common = fail_teams[0].intersection(*fail_teams[1:])
-            if common:
-                lines.append(f"  ⚠ CROSS-QUEST: {[_n(state, s) for s in common]} present on EVERY failed quest.")
-
     return "\n".join(lines)
-
-def _build_leader_rotation(state) -> str:
-    current = state.leader_slot
-    names = state.slot_to_name
-    rotation = [(current + i) % 5 for i in range(5)]
-    entries = []
-    for i, slot in enumerate(rotation):
-        if i == 0:
-            entries.append(f"{names[slot]} (current)")
-        else:
-            entries.append(f"{names[slot]} (+{i} rejection{'s' if i > 1 else ''})")
-    return "LEADER ROTATION THIS QUEST: " + " → ".join(entries)
 
 def _build_player_quest_summary(state) -> str:
-    if not state.mission_history:
-        return ""
-    record = {name: [] for name in state.slot_to_name.values()}
-    for m in state.mission_history:
-        for slot in m.team:
-            record[state.slot_to_name[slot]].append(f"Q{m.quest_num}{'✓' if m.result == 'SUCCESS' else '✗'}")
-    lines = ["PLAYER QUEST HISTORY:"]
-    for name, quests in record.items():
-        lines.append(f"  {name}: {' '.join(quests) if quests else 'no quests yet'}")
-    return "\n".join(lines)
+    """Deprecated: per-player quest marks are now embedded in the deterministic
+    running digest. Kept as a stub so any external import doesn't crash."""
+    return ""
+
+def _build_leader_rotation(state) -> str:
+    """Deprecated: cosmetic block. The leader's identity is already in the quest
+    header line. Kept as a stub so external imports don't crash."""
+    return ""
 
 def _get_confirmed_evil_names(state) -> list[str]:
     """Players mathematically confirmed evil: N fails on N-person team."""
@@ -736,57 +694,26 @@ def _get_high_suspicion_names(state) -> list[str]:
 
 
 def _build_confirmed_evil_players(state, my_slot: int) -> str:
-    """Only emit this block for GOOD players — evil players already know who they are,
-    so a block describing public cover-status is zero decision-utility for them."""
-    role = state.slot_to_role[my_slot]
-    faction = ROLES_CONFIG[role]["faction"]
-    if faction != "good":
-        return ""
-    confirmed = _get_confirmed_evil_names(state)
-    suspicious = _get_high_suspicion_names(state)
-    if not confirmed and not suspicious:
-        return ""
-    lines = ["DEDUCTION FROM PUBLIC QUEST MATH:"]
-    if confirmed:
-        lines.append(f"  CONFIRMED EVIL (mathematical proof): {confirmed}")
-    if suspicious:
-        lines.append(f"  HIGH SUSPICION (2+ failed quests): {suspicious}")
-    return "\n".join(lines)
+    """Deprecated: confirmed-evil math and high-suspicion lists are already in the
+    deterministic running digest (`build_running_digest`). Kept as a stub so
+    external imports don't crash."""
+    return ""
 
-_FRAMING_GUIDE = {
-    "Merlin": "Speak from PUBLIC evidence only (\"X voted REJECT on a clean team at 2-2\"), never \"I know\". Reasonable disagreement is not a tell.",
-    "Percival": "Act uncertain between your two Merlin candidates; align with whichever's guidance proves accurate. Never declare either as Merlin publicly.",
-    "LoyalServant": "No hidden info — your strength is public deduction. Cite specific evidence (\"X was on Q1 and Q3 fails\"). \"I don't know\" is honest and not a Merlin tell.",
-    "Assassin": "Sound like a Loyal Servant reasoning publicly. Plausible-but-wrong theories and split-ticket votes work — vary your voice from your ally.",
-    "Morgana": "Imitate evidence-based confidence so Percival can't pick you from the real Merlin. Vary votes/arguments from the Assassin.",
+_PUBLIC_TELLS = {
+    "Merlin": "Assassin tells (observed): rejection-heavy voting (±2 REJECT vs APPROVE), specific naming of players as evil without public evidence, aggregate statistical claims without visible basis, early analytical dominance in discussion.",
+    "Percival": "Assassin tells to avoid (observed): naming both Merlin candidates together by name in public, using 'my candidates' or 'the two I see as Merlin' language, perfect lockstep voting with one candidate across all proposals.",
+    "LoyalServant": "No hidden info — your strength is public deduction. Cite specific evidence ('X was on Q1 and Q3 fails'). 'I don't know' is honest and not a Merlin tell.",
+    "Assassin": "Your cover goal: sound like a Loyal Servant reasoning publicly. Plausible-but-wrong theories and split-ticket votes work. Vary your voice from your ally.",
+    "Morgana": "Your cover goal: imitate evidence-based confidence so Percival can't pick you from the real Merlin. Vary votes/arguments from the Assassin.",
 }
 
-_VOTE_GUIDE = {
-    "Merlin": "You know evil. VOTE in patterns only that knowledge explains — but that is also the Assassin's signal. Trade off case by case.",
+_VOTE_CONTEXT = {
+    "Merlin": "You know evil identities. Your vote patterns can reveal this knowledge. The Assassin tracks rejection-heavy voting as a primary signal.",
     "Percival": "Watch each Merlin candidate's team guidance; align your votes with whichever proves accurate — without revealing which.",
     "LoyalServant": "No hidden info. Vote only from observable evidence — prior fails, vote patterns, statement consistency.",
-    "Assassin": "Lockstep with Morgana is detectable. Vary your stance from your ally when you can do so plausibly.",
-    "Morgana": "Lockstep with the Assassin is detectable. Vary your stance from your ally when you can do so plausibly.",
+    "Assassin": "Lockstep with Morgana is detectable. Split-ticket votes and varied arguments create deniability.",
+    "Morgana": "Lockstep with the Assassin is detectable. Split-ticket votes and varied arguments create deniability.",
 }
-
-
-def get_analysis_prompt(state, slot_id: int, context_hint: str, phase: str = "vote") -> str:
-    """Pre-decision analysis pass. Deduction only — no action decision.
-    `phase` = which decision phase this analysis precedes ('proposal' or 'vote'),
-    so the matching phase lessons are surfaced here too."""
-    role = state.slot_to_role[slot_id]
-    context = _build_game_context(state, slot_id)
-    lessons = _phase_lessons_block(state, role, phase)
-    return (
-        f"{context}{lessons}"
-        f"Context for this analysis: {context_hint}\n\n"
-        f"TASK — Analyze only. Do not decide your action yet.\n"
-        f"1. What does quest math confirm with certainty? (fail counts, team compositions)\n"
-        f"2. What is your current read on each player's alignment and why?\n"
-        f"3. Have any players contradicted themselves across rounds? Name them specifically.\n"
-        f"4. What is the single most important objective for your faction this round?\n\n"
-        f'{{"certain_facts": "...", "suspicion_model": "...", "contradiction": "...", "priority": "..."}}\n'
-    )
 
 
 def get_discussion_prompt(state, slot_id: int) -> str:
@@ -801,12 +728,12 @@ def get_discussion_prompt(state, slot_id: int) -> str:
         if prior else
         f"Your turn to speak first in the Q{state.quest_num} discussion. No one has spoken yet."
     )
-    framing = _FRAMING_GUIDE.get(role, "")
+    public_tells = _PUBLIC_TELLS.get(role, "")
     return (
         f"{priority}\n\n{memory}{context}{lessons}"
         f"PHASE: DISCUSSION. Your statement is PUBLIC.\n"
         f"{turn}\n"
-        f"Framing: {framing}\n\n"
+        f"Observed public tells: {public_tells}\n\n"
         f'REQUIRED JSON — exactly these fields, in this order:\n'
         f'{{"statement": "<your public speech as I/me>", "private_note": "<ONE LINE ~25 words: what this Statement just moved on YOUR read>"}}\n'
     )
@@ -849,10 +776,10 @@ def get_proposal_prompt(state, slot_id: int, team_size: int, retry_hint: str = N
         lines.append("FINAL PROPOSAL — rejection = evil wins immediately.")
     elif current_proposal_num == 4:
         lines.append("If rejected, the next (5/5) proposal is the last before auto-evil-win.")
-    lines.append("Don't REJECT your own proposal — it kills your credibility.")
-    lines.append("Include yourself by default — costs nothing on success, lets you read your own card on failure.")
+    lines.append("Proposing and then REJECTING your own team destroys leader credibility.")
+    lines.append("Including yourself on the team: no cost on SUCCESS, lets you read your own card on FAIL.")
     if ROLES_CONFIG[role]["faction"] == "evil":
-        lines.append("Don't double-fail a small team — 2 fails on 2-person exposes you both.")
+        lines.append("2 fails on a 2-person team mathematically exposes both evil players.")
 
     user = (
         f"{priority}\n\n{memory}{context}{lessons}"
@@ -929,11 +856,11 @@ def get_vote_prompt(state, slot_id: int, proposer_slot: int, proposed_team: List
             lines.append("Evil on team? a FAIL wins immediately." if evil_on
                          else "No evil — mission succeeds regardless of your vote.")
 
-    vote_guide = _VOTE_GUIDE.get(role, "")
+    vote_context = _VOTE_CONTEXT.get(role, "")
     return (
         f"{priority}\n\n{memory}{context}{lessons}"
         + "\n".join(lines) + "\n\n"
-        f"Voting hint: {vote_guide}\n"
+        f"Vote context: {vote_context}\n"
         f"Both your vote and your reason are public — cite a specific named player/behavior.\n\n"
         f'REQUIRED JSON — exactly these fields:\n'
         f'{{"vote": "<APPROVE or REJECT>", "speech": "<your public reason>", "private_note": "<ONE LINE ~25 words: what this vote just moved on YOUR read>"}}\n'
@@ -966,8 +893,7 @@ def get_mission_prompt(state, slot_id: int, role: str, team: List[int]) -> str:
             lines.append(f"All evil on this {len(team)}-person team — 1 FAIL fails it; 2 FAILs exposes you both mathematically.")
         elif evil_on_team_count > 1:
             lines.append("Multiple evil here — one FAIL suffices; extra FAILs narrow the suspect pool.")
-        lines.append(f"Mission hint: keep cover beyond this single quest; your survival matters for the Assassin's eventual guess.")
-        schema = '{"card": "<SUCCESS or FAIL>", "internal_note": "<ONE LINE ~25 words: why this card: cover/sabotage/cover-protect-ally>"}\n'
+        schema = '{"card": "<SUCCESS or FAIL>", "internal_note": "<ONE LINE ~25 words: reasoning for this card choice>"}\n'
 
     role = state.slot_to_role[slot_id]
     return (
@@ -1015,12 +941,15 @@ def get_assassin_prompt(state, assassin_slot: int) -> str:
         f"ALL DISCUSSION (verbatim):\n{all_disc}\n\n"
         f"YOUR NOTES:\n{my_notes}\n\n"
         f"Candidates (anyone except you): {candidates}\n\n"
-        f"Guess heuristics — weigh observable behavior:\n"
+        f"Observable patterns associated with Merlin (across games):\n"
         f"  - Proposals/votes that consistently differ from public evidence imply hidden knowledge.\n"
-        f"  - A player who accuses by name with a plausible chain is more credible than vague gesturing.\n"
+        f"  - A player who accuses by name with a plausible evidence chain is more credible than vague gesturing.\n"
         f"  - A player present on a SUCCESS where evil was provably present is provably good.\n"
         f"  - A player never appearing on FAIL quests is suspicious but not conclusive.\n"
-        f"  - If Percival visibly aligns with one candidate over the other, that is a strong (itself unprovable) signal.\n"
+        f"  - If Percival visibly aligns with one candidate over the other, that is a signal (itself unprovable).\n"
+        f"  - PERCIVAL FALSE-POSITIVE: a player who EARLY (Q1) names TWO SPECIFIC players as suspects without mission data is more often PERCIVAL than Merlin, because Percival sees two public Merlin candidates. Discount dual early-naming as a primary tell unless one candidate is provably cleared.\n"
+        f"  - CROSS-CHECK: before locking a guess, ask 'could this player equally be Percival?' If yes, the visible signal is underdetermined.\n"
+        f"  - REJECT-TELL: tally APPROVE/REJECT counts. A player with rejection-heavy voting (≥2 more rejects than approves) is stronger Merlin material than a player whose balance mirrors the room.\n"
         f"{lessons}"
         f'REQUIRED JSON — exactly these fields:\n'
         f'{{"guess_name": "<one name from candidates>", "reasoning": "<your full analysis>"}}\n'

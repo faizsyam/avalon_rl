@@ -13,7 +13,6 @@ from agents.prompts import (
     get_vote_prompt,
     get_mission_prompt,
     get_assassin_prompt,
-    get_analysis_prompt,
 )
 from agents.llm_client import call_llm_json, log_llm_call
 from agents.schemas import (
@@ -23,7 +22,6 @@ from agents.schemas import (
     VoteOutput,
     MissionOutput,
     AssassinOutput,
-    AnalysisOutput,
 )
 from storage.printer import (
     print_game_header, print_quest_header, print_discussion_header,
@@ -39,7 +37,11 @@ from storage.printer import (
 class GameEngine:
     def __init__(self, llm, analysis_llm=None):
         self.llm = llm
-        self.analysis_llm = analysis_llm or llm
+        # Pre-decision "analysis" LLM passes were dropped — the deterministic
+        # digest + lessons are sufficient context. `analysis_llm` kept as a
+        # constructor argument for backward compatibility with callers that
+        # still pass it; it now goes unused.
+        self.analysis_llm = analysis_llm if analysis_llm is not None else llm
         self._system_cache: Dict[str, str] = {}
         # Cache of (state_id, slot, phase) -> context string. State is mutated only
         # between quest turns / between proposals, so caching by (state version, slot) is
@@ -292,10 +294,6 @@ class GameEngine:
         leader = state.leader_slot
         role = state.slot_to_role[leader]
 
-        analysis = self._run_analysis_pass(state, leader, f"choosing a {team_size}-person team to propose for Q{state.quest_num}", phase="proposal")
-        if analysis:
-            self._append_note(state, leader, f"[PRE-PROPOSAL ANALYSIS Q{state.quest_num}] {analysis}")
-
         last_hint = None
         for attempt in range(3):
             result = call_llm_json(
@@ -373,11 +371,6 @@ class GameEngine:
         team_names = [state.slot_to_name[s] for s in team]
         for slot in range(5):
             role = state.slot_to_role[slot]
-
-            # Analysis pre-pass: deduction isolated from decision
-            analysis = self._run_analysis_pass(state, slot, f"voting on proposed team {team_names}", phase="vote")
-            if analysis:
-                self._append_note(state, slot, f"[PRE-VOTE ANALYSIS Q{state.quest_num}] {analysis}")
 
             result = call_llm_json(
                 self.llm,
@@ -578,33 +571,9 @@ class GameEngine:
         state.log_lines.append(f"Merlin was {merlin_name}. Correct: {state.assassin_correct}")
         print_assassin_guess(guess, reasoning, merlin_slot, state.assassin_correct, state.slot_to_name)
 
-    def _run_analysis_pass(self, state: GameState, slot: int, context_hint: str, phase: str = "vote") -> str:
-        """Isolated deduction call at low temperature before an action decision.
-        Result is injected into agent notes so it appears in the next prompt's context.
-        `phase` = which decision phase this analysis precedes ('proposal' or 'vote')."""
-        role = state.slot_to_role[slot]
-        result = call_llm_json(
-            self.analysis_llm,
-            self._system(role, state),
-            get_analysis_prompt(state, slot, context_hint, phase),
-            call_label=f"analysis Q{state.quest_num} Slot{slot}",
-        )
-        if not result:
-            return ""
-        parts = []
-        if result.get("certain_facts"):
-            parts.append(f"CERTAIN: {result['certain_facts']}")
-        if result.get("suspicion_model"):
-            parts.append(f"READS: {result['suspicion_model']}")
-        if result.get("contradiction"):
-            parts.append(f"CONTRADICTION DETECTED: {result['contradiction']}")
-        if result.get("priority"):
-            parts.append(f"THIS ROUND PRIORITY: {result['priority']}")
-        return "\n".join(parts)
-
     def _inject_situational_notes(self, state: GameState):
         """Inject factual consequence reminders into agent notes before decisions.
-        No decisions are made here — only information is surfaced."""
+        No decisions are made here — only objective game-state facts are surfaced."""
 
         proposal_num = len([v for v in state.vote_history if v.quest_num == state.quest_num]) + 1
 
@@ -618,7 +587,7 @@ class GameEngine:
                     "If the majority rejects it, evil wins the entire game immediately — regardless of team composition."
                 )
 
-            # Merlin fingerprint detection — inform, do not direct.
+            # Factual note: if Merlin has proposed identical teams before, note the composition
             if role == "Merlin":
                 prior_merlin_teams = [
                     frozenset(v.proposed_team)
@@ -632,7 +601,6 @@ class GameEngine:
                     ]
                     if prior_summaries:
                         self._append_note(state, slot,
-                            f"[MERLIN FINGERPRINT WARNING] You have previously proposed these "
-                            f"team(s): {prior_summaries}. Repeating a composition is one signal "
-                            "the Assassin tracks — but so is wildly varying teams. Use your judgment."
+                            f"[TEAM COMPOSITION HISTORY] Your prior proposals: {prior_summaries}. "
+                            "Repeating a composition has occurred in games where the Assassin tracked it."
                         )
