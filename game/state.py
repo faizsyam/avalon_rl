@@ -1,3 +1,5 @@
+"""Dataclasses representing game history, vote records, mission logs, and mutable game state."""
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 

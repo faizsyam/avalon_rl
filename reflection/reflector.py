@@ -1,3 +1,28 @@
+"""Post-game reflection pipeline — extracts and validates new strategic lessons.
+
+After each game, ``run_reflection(state, llm)`` runs 7 LLM calls:
+  - 5 per-role calls  (Merlin, Percival, LoyalServant, Assassin, Morgana)
+  - 1 evil coordination call  (shared Assassin + Morgana strategy)
+  - 1 good coordination call  (shared Merlin + Percival + LoyalServant strategy)
+
+Each call follows this pipeline:
+  1. Build context  — agent's statements, votes, proposals, missions, in-game notes
+  2. Build targeted questions  — role-specific prompts (e.g., Merlin assassination audit)
+  3. Call LLM with prefill to force phase-keyed JSON output
+  4. Validate / repair / drop each emitted lesson via memory.manager
+  5. Sanitize player names  → replace with "a player" to prevent over-fitting
+  6. Apply delta to lesson files via apply_lesson_delta()
+
+Output schema per role:
+  {
+    "add_tentative":   [{"phase": "...", "lesson": "...", "grounding": "..."}],
+    "confirm_active":  [{"phase": "...", "keyword": "..."}],
+    "flag_deprecated": [{"phase": "...", "keyword": "...", "reason": "..."}]
+  }
+
+Note: ``grounding`` is a private citation field used only for quality control —
+it is never persisted to lesson files.
+"""
 import json as _json
 from config import LOGS_DIR
 
@@ -16,6 +41,7 @@ from memory.manager import (
     snapshot_all_lessons,
     snapshot_all_coord,
 )
+from config import LOGS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
 
 MAX_REFLECTION_RETRIES = 2
 

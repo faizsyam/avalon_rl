@@ -1,3 +1,9 @@
+"""Main orchestrator for the Avalon Self-Learning Agents experiment.
+
+Runs the simulation loop, triggers reflection after each game, manages periodic
+and on-demand lesson consolidation, saves checkpoints, and evaluates stopping criteria.
+"""
+
 import os
 
 from config import (
@@ -34,7 +40,6 @@ from storage.printer import (
 )
 from game.roles import ALL_ROLES
 from memory.manager import should_consolidate_now, get_lesson_path, EVIL_COORD_FILE, GOOD_COORD_FILE
-import glob
 
 def run():
     for d in [LESSONS_DIR, LOGS_DIR, CHECKPOINTS_DIR]:
@@ -48,7 +53,7 @@ def run():
     start_game = load_run_state()
 
     print(f"\n{BOLD}{'═'*60}{RESET}")
-    print(f"{BOLD}{YELLOW}  AVALON RL EXPERIMENT{RESET}")
+    print(f"{BOLD}{YELLOW}  AVALON SELF-LEARNING AGENTS{RESET}")
     print(f"{DIM}  Resuming from game {start_game}{RESET}")
     print(f"{BOLD}{'═'*60}{RESET}")
 

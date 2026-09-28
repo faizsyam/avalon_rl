@@ -1,9 +1,21 @@
+"""Experiment metrics, checkpointing, and convergence detection.
+
+Tracks cumulative win rates and per-role lesson snapshots across all games.
+Provides two auto-stopping criteria:
+
+  - **Win dominance**: one faction wins ≥85 % of the last 30 games.
+  - **Lesson stability**: average Jaccard similarity between consecutive whole-file
+    lesson snapshots reaches ≥90 % across all roles (checked after game 40).
+
+Also manages periodic checkpoints (copies of all lesson files saved every
+CHECKPOINT_EVERY games) for rollback and post-hoc analysis.
+"""
 import json
 import os
 import shutil
 from typing import Optional
 
-from config import METRICS_FILE, STOPPING, CHECKPOINTS_DIR, EVIL_COORD_FILE
+from config import METRICS_FILE, STOPPING, CHECKPOINTS_DIR, EVIL_COORD_FILE, GOOD_COORD_FILE
 from game.roles import ALL_ROLES
 from memory.manager import get_lesson_path, snapshot_all_lessons
 
@@ -58,6 +70,12 @@ def snapshot_lessons(metrics: dict, game_id: int):
 
 
 def save_checkpoint(game_id: int):
+    """Copy all lesson files and both coordination files to a numbered checkpoint dir.
+
+    Checkpoints are saved every CHECKPOINT_EVERY games (default: 20) and also
+    at experiment end. They provide rollback points and allow comparing strategy
+    evolution across the run.
+    """
     dest = os.path.join(CHECKPOINTS_DIR, f"checkpoint_g{game_id:03d}")
     os.makedirs(dest, exist_ok=True)
     for role in ALL_ROLES:
@@ -66,6 +84,8 @@ def save_checkpoint(game_id: int):
             shutil.copy(src, os.path.join(dest, f"{role.lower()}.txt"))
     if os.path.exists(EVIL_COORD_FILE):
         shutil.copy(EVIL_COORD_FILE, os.path.join(dest, "evil_coordination.txt"))
+    if os.path.exists(GOOD_COORD_FILE):
+        shutil.copy(GOOD_COORD_FILE, os.path.join(dest, "good_coordination.txt"))
     print(f"  Checkpoint saved → {dest}")
 
 

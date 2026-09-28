@@ -1,6 +1,9 @@
-# Per-role reflection is organized by GAME PHASE — a lesson belongs to exactly one
-# phase and is only surfaced to the agent at that phase. Assassin additionally has
-# the `assassin` phase (the final Merlin guess); other roles have the 4 phase buckets.
+"""Role definitions, faction alignments, phase mappings, and phase descriptions.
+
+Per-role reflection is organized by GAME PHASE — a lesson belongs to exactly one
+phase and is only surfaced to the agent at that phase. Assassin additionally has
+the `assassin` phase (the final Merlin guess); other roles have the 4 phase buckets.
+"""
 
 _GAME_PHASES = ["discussion", "proposal", "vote", "mission"]
 

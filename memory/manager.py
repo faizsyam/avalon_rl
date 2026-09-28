@@ -1,3 +1,24 @@
+"""Lesson memory system — storage, validation, repair, and consolidation.
+
+Each of the five agent roles has a plain-text lesson file at
+``data/lessons/{role}.txt``. Lessons are organized into **phase buckets**
+(discussion / proposal / vote / mission; plus assassin for the Assassin role).
+Two shared coordination files (``evil_coordination.txt``, ``good_coordination.txt``)
+follow the same format for cross-role team strategy.
+
+Lesson lifecycle:
+    LLM emits lesson → validate_lesson() → repair_lesson() (if needed) → drop
+                                ↓
+                         add as TENTATIVE
+                                ↓
+                    (consolidation LLM pass)
+                                ↓
+                ACTIVE  ──────────────────►  DEPRECATED
+                (high-confidence)            (contradicted / evicted)
+
+Caps (enforced at consolidation): 5 TENTATIVE + 5 ACTIVE per phase.
+Drops and repairs are logged to ``data/logs/reflection_debug.log``.
+"""
 import os
 import re
 from typing import Dict, List, Optional

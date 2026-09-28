@@ -1,3 +1,5 @@
+"""Terminal formatting and ANSI-colored live event output for Avalon games."""
+
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
 DIM     = "\033[2m"

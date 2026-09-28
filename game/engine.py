@@ -1,3 +1,19 @@
+"""Game engine — runs one complete game of The Resistance: Avalon with LLM agents.
+
+``GameEngine.run_game(game_id)`` is the top-level entry point. It orchestrates:
+
+  Setup → Quest loop (Discussion → Proposal → Vote → Mission) → Assassin phase
+
+Key design decisions:
+  - **Context caching**: system + context strings are cached per (state_version, slot, phase)
+    to avoid rebuilding ~1,500-token strings on every phase call within the same round.
+  - **Running digest**: a deterministic public-evidence summary is recomputed after every
+    vote and mission (no LLM cost) so each agent's prompt always reflects the latest state.
+  - **Phase memory**: each agent's own per-phase reasoning is compressed to a single
+    ≤140-char bulletin and carried forward into subsequent phase prompts within the game.
+  - **Situational notes**: factual consequence reminders are injected into agent context
+    before high-stakes decisions (e.g., "Proposal 5/5 — rejection = instant evil win").
+"""
 import random
 from collections import Counter
 from typing import Dict, List, Tuple
@@ -161,6 +177,15 @@ class GameEngine:
         return state
 
     def run_game(self, game_id: int) -> GameState:
+        """Run one complete Avalon game and return the final GameState.
+
+        Runs the quest loop until one faction reaches QUESTS_TO_WIN (3) quest wins,
+        then triggers the assassin phase if Good won. Sets ``state.outcome`` to
+        ``"GOOD_WINS"`` or ``"EVIL_WINS"`` before returning.
+
+        Side effects: prints a live game transcript to stdout and writes detailed
+        log entries to ``state.log_lines`` (persisted later by storage.logger).
+        """
         state = self.setup_game(game_id)
         while state.good_wins < QUESTS_TO_WIN and state.evil_wins < QUESTS_TO_WIN:
             self._run_quest(state)

@@ -1,3 +1,9 @@
+"""Prompt templates and builders for all game phases and agent roles.
+
+Constructs structured context including vote history, mission deductions, running
+digests, private notes, and phase-specific lessons from memory.
+"""
+
 from typing import List
 from game.roles import ROLES_CONFIG
 from config import QUEST_TEAM_SIZES
@@ -25,7 +31,7 @@ GAME: The Resistance: Avalon (5 players). Factions: Good (Merlin, Percival, Loya
 
 WIN CONDITIONS:
 - Good: complete 3 successful quests AND survive Assassin's final Merlin guess.
-- Evil: fail 3 quests, OR guess Merlin correctly after good reaches 3, OR trigger 5 consecutive rejections on one quest.
+- Evil: fail 3 quests (primary path — within your control across multiple quests), OR guess Merlin correctly after good reaches 3 (fallback — one uncertain attempt, only if the primary path failed), OR trigger 5 consecutive rejections on one quest.
 
 INITIAL KNOWLEDGE:
 - Merlin knows the 2 evil players by name.
@@ -54,6 +60,7 @@ ROLE_CONTEXT = {
 === MERLIN (GOOD) ===
 Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
 Hidden knowledge: You know the 2 evil players by name from the start.
+Your stake: you need to steer toward teams without evil without revealing that the knowledge exists — clean teams advance your win condition; exposing your hidden knowledge hands the assassin your identity.
 Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
 Assassin tells (observed patterns): rejection-heavy voting patterns, specific naming without public evidence, aggregate statistical claims without visible basis, early analytical dominance.
 """,
@@ -62,6 +69,7 @@ Assassin tells (observed patterns): rejection-heavy voting patterns, specific na
 === PERCIVAL (GOOD) ===
 Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
 Hidden knowledge: You see 2 players as "Merlin" (real Merlin + Morgana). You cannot tell them apart directly.
+Your stake: you need to determine which candidate is the real Merlin (trustworthy) vs Morgana (deceptive) — correct identification lets you back accurate reads; wrong identification helps evil.
 Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
 Assassin tells (observed patterns): naming both Merlin candidates by name in public, perfect lockstep with one candidate, using phrases like "my candidates" or "the two I see as Merlin".
 """,
@@ -70,6 +78,7 @@ Assassin tells (observed patterns): naming both Merlin candidates by name in pub
 === LOYAL SERVANT (GOOD) ===
 Faction: Good. Win condition: complete 3 successful quests AND survive the Assassin's final Merlin guess.
 Hidden knowledge: None. You reason only from observable evidence: votes, proposals, quest outcomes, statements.
+Your stake: you need to deduce which players are evil through public patterns — building teams without evil is how good wins; your purely public reasoning has no hidden knowledge to leak, so it cannot be a Merlin tell.
 Mission play: Good always plays SUCCESS. Evil may play SUCCESS or FAIL.
 Public math: A failed quest proves ≥ fail-count evil on the team; a success proves nothing (evil may play SUCCESS for cover).
 Strength: Your deductions are publicly derivable — you prove good can sound like a confident reader. "I don't know" is honest and not a Merlin tell.
@@ -77,16 +86,18 @@ Strength: Your deductions are publicly derivable — you prove good can sound li
 
     "Assassin": """
 === ASSASSIN (EVIL) ===
-Faction: Evil. Win condition: fail 3 quests before good reaches 3, OR guess Merlin correctly if good reaches 3.
+Faction: Evil. Win condition: (a) fail 3 quests — the primary, more reliable path you control across multiple quests; (b) if good reaches 3 first, one Assassin guess at Merlin — a single uncertain attempt, not a guaranteed win.
 Hidden knowledge: You know Morgana (your evil ally) by name.
+Your stake: you need Merlin's identity for the final guess and you need to fail quests — but pushing for teams that cleanly isolate players (tests that would mathematically confirm good) can expose you or your ally, which hurts shared win/loss.
 Mission play: Evil chooses SUCCESS (cover) or FAIL (sabotage). One FAIL fails the quest. You or Morgana alone can FAIL.
 Observed tells (Assassin-visible): lockstep voting with Morgana, identical arguments, double-failing a small team (2 fails on 2-person team mathematically exposes both evil players).
 """,
 
     "Morgana": """
 === MORGANA (EVIL) ===
-Faction: Evil. Win condition: fail 3 quests before good reaches 3, OR help the Assassin identify Merlin if good reaches 3.
+Faction: Evil. Win condition: (a) fail 3 quests — the primary, more reliable path within your control; (b) if good reaches 3, help the Assassin identify Merlin — one guess with no guarantee.
 Hidden knowledge: You know the Assassin (your evil ally) by name.
+Your stake: you need Merlin's identity for the Assassin's final guess and you need to fail quests — but advocating for teams that cleanly test individual players (isolating good from evil mathematically) can expose you, which hurts shared win/loss.
 Mission play: Evil chooses SUCCESS or FAIL. You appear as "Merlin" to Percival.
 Observed tells: Lockstep voting with the Assassin is detectable. Double-failing a small team reveals both evil players. You can help the Assassin track Merlin through shared private reads.
 """,
@@ -102,6 +113,8 @@ PUBLIC vs PRIVATE:
 - private_note / internal_note / reasoning are PRIVATE — never spoken aloud.
 
 OPSEC: never state your role, faction, or hidden knowledge publicly. Role-aware reasoning goes ONLY in private_note / internal_note.
+
+FACTION OUTCOMES: Your win or loss is shared with your faction-mates — one evil player's outcome is the other's too. Your hidden role is confidential from the opposing team by definition; reason as a participant whose stake includes your ally's exposure risk, not as a neutral observer.
 
 SPEAKING STYLE: refer to yourself as "I"/"me", never by name. Cite a SPECIFIC named player (vote, proposal, or statement) when you justify a position.
 

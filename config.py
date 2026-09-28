@@ -1,3 +1,5 @@
+"""Global configuration, hyperparameters, model endpoints, and storage paths."""
+
 import os
 from dotenv import load_dotenv
 
@@ -20,7 +22,7 @@ NVIDIA_API_KEYS = [k for k in (NVIDIA_API_KEY1, NVIDIA_API_KEY2, NVIDIA_API_KEY3
 NVIDIA_API_KEY = NVIDIA_API_KEYS[0] if NVIDIA_API_KEYS else ""
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-MODEL_NAME = os.getenv("MODEL_NAME", "meta/llama-3.1-70b-instruct")
+MODEL_NAME = os.getenv("MODEL_NAME", "nvidia/nemotron-3-ultra-550b-a55b")
 
 GAMEPLAY_MAX_TOKENS = 32768
 REFLECTION_MAX_TOKENS = 32768
